@@ -24,7 +24,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
-# Чтение ADMIN_ID из переменных или по умолчанию
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "7837011810"))
 
 CHANNEL_ID = "@Premium_Giive"
@@ -38,13 +37,13 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 
-# Хранилище в памяти
-active_orders = {}      # Активные заказы
-all_users = set()       # Уникальные пользователи
-total_purchases = 0     # Число покупок
-total_earned = 0        # Заработано грн
+# Базы данных в памяти
+active_orders = {}      # Активные заказы на проверке
+all_users = set()       # Множество всех уникальных ID пользователей
+total_purchases = 0     # Количество успешных покупок
+total_earned = 0        # Всего заработано грн
 
-# ==================== ЗАПИСЬ В GITHUB ====================
+# ==================== СИНХРОНИЗАЦИЯ С GITHUB ====================
 def _sync_append_order_to_github(order_text):
     try:
         if not GITHUB_TOKEN:
@@ -63,6 +62,39 @@ def _sync_append_order_to_github(order_text):
 
 async def append_order_to_github(order_text):
     await asyncio.to_thread(_sync_append_order_to_github, order_text)
+
+def _sync_load_stats_from_github():
+    """Загрузка статистики из GitHub при перезапуске бота"""
+    global total_purchases, total_earned
+    try:
+        if not GITHUB_TOKEN:
+            return
+        g = Github(GITHUB_TOKEN)
+        repo = g.get_repo(GITHUB_REPO_NAME)
+        try:
+            contents = repo.get_contents(GITHUB_ORDERS_PATH)
+            lines = contents.decoded_content.decode("utf-8").splitlines()
+            
+            p_count = 0
+            earned = 0
+            for line in lines:
+                if "Price:" in line:
+                    p_count += 1
+                    if "160" in line:
+                        earned += 160
+                    elif "1300" in line:
+                        earned += 1300
+            
+            total_purchases = p_count
+            total_earned = earned
+            logging.info(f"Успешно загружена статистика: Покупок={p_count}, Заработано={earned}")
+        except Exception:
+            logging.warning("Файл заказов в GitHub пока не создан.")
+    except Exception as e:
+        logging.error(f"Ошибка чтения статистики с GitHub: {e}")
+
+async def load_stats_from_github():
+    await asyncio.to_thread(_sync_load_stats_from_github)
 
 # ==================== MIDDLEWARE ПРОВЕРКИ ЮЗЕРНЕЙМА ====================
 class CheckUsernameMiddleware(BaseMiddleware):
@@ -162,7 +194,6 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     all_users.add(message.from_user.id)
     
-    # Если зашёл админ — выводим сообщение с подтверждением связи
     if message.from_user.id == ADMIN_ID:
         text = (
             "👑 Вы авторизованы как Администратор!\n"
@@ -347,7 +378,6 @@ async def process_receipt(message: Message, state: FSMContext):
         f"💸 Сумма: {order_data['price_str']}"
     )
     
-    # Отправка администратору с обработкой возможных ошибок
     try:
         await bot.send_photo(
             chat_id=ADMIN_ID,
@@ -357,7 +387,7 @@ async def process_receipt(message: Message, state: FSMContext):
             parse_mode="Markdown"
         )
     except Exception as e:
-        logging.error(f"⚠️ НЕ УДАЛОСЬ ОТПРАВИТЬ ЧЕК АДМИНУ ({ADMIN_ID}): {e}")
+        logging.error(f"⚠️ Не удалось отправить чек админу: {e}")
 
     await state.clear()
 
@@ -369,7 +399,7 @@ async def admin_approve(call: CallbackQuery):
     order_info = active_orders.get(clean_code)
     
     if not order_info:
-        await call.answer("Заказ устарел или уже был обработан.", show_alert=True)
+        await call.answer("Заказ устарел или был обработан до перезапуска сервера.", show_alert=True)
         return
 
     target_user_id = order_info["user_id"]
@@ -382,6 +412,7 @@ async def admin_approve(call: CallbackQuery):
     total_purchases += 1
     total_earned += price_num
 
+    # Сохраняем информацию о заказе в GitHub
     order_log_line = f"Заказ: {order_id} | UserID: {target_user_id} | Phone: {phone} | Item: {item} | Price: {price_str}"
     asyncio.create_task(append_order_to_github(order_log_line))
 
@@ -438,6 +469,10 @@ async def admin_reject(call: CallbackQuery):
 # ==================== ЗАПУСК ====================
 async def main():
     logging.basicConfig(level=logging.INFO)
+    
+    # Загружаем сохранённую статистику из GitHub при каждом старте бота
+    await load_stats_from_github()
+    
     asyncio.create_task(keep_alive())
     
     await bot.delete_webhook(drop_pending_updates=True)
