@@ -37,14 +37,15 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 
-# Базы данных в памяти
-active_orders = {}      # Активные заказы на проверке
-all_users = set()       # Множество всех уникальных ID пользователей
-total_purchases = 0     # Количество успешных покупок
-total_earned = 0        # Всего заработано грн
+# Хранилища в памяти
+active_orders = {}      # Заказы, ждущие проверки
+all_users = set()       # Уникальные пользователи
+total_purchases = 0     # Успешных покупок
+total_earned = 0        # Заработано всего грн
 
 # ==================== СИНХРОНИЗАЦИЯ С GITHUB ====================
-def _sync_append_order_to_github(order_text):
+def _sync_append_to_github(text_line):
+    """Добавление строки в файл на GitHub"""
     try:
         if not GITHUB_TOKEN:
             return
@@ -53,19 +54,19 @@ def _sync_append_order_to_github(order_text):
         try:
             contents = repo.get_contents(GITHUB_ORDERS_PATH)
             old_content = contents.decoded_content.decode("utf-8")
-            new_content = old_content + "\n" + order_text
-            repo.update_file(GITHUB_ORDERS_PATH, "Новый заказ", new_content, contents.sha)
+            new_content = old_content + "\n" + text_line
+            repo.update_file(GITHUB_ORDERS_PATH, "Запись данных", new_content, contents.sha)
         except Exception:
-            repo.create_file(GITHUB_ORDERS_PATH, "Инициализация заказов", order_text)
+            repo.create_file(GITHUB_ORDERS_PATH, "Инициализация", text_line)
     except Exception as e:
-        logging.error(f"Ошибка сохранения заказа в GitHub: {e}")
+        logging.error(f"Ошибка записи в GitHub: {e}")
 
-async def append_order_to_github(order_text):
-    await asyncio.to_thread(_sync_append_order_to_github, order_text)
+async def append_to_github(text_line):
+    await asyncio.to_thread(_sync_append_to_github, text_line)
 
-def _sync_load_stats_from_github():
-    """Загрузка статистики из GitHub при перезапуске бота"""
-    global total_purchases, total_earned
+def _sync_load_data_from_github():
+    """Загрузка пользователей и всей статистики из GitHub при запуске"""
+    global total_purchases, total_earned, all_users
     try:
         if not GITHUB_TOKEN:
             return
@@ -77,24 +78,45 @@ def _sync_load_stats_from_github():
             
             p_count = 0
             earned = 0
+            users = set()
+
             for line in lines:
-                if "Price:" in line:
+                # Извлекаем ID пользователей
+                if "USER_REGISTERED:" in line:
+                    try:
+                        uid = int(line.split(":")[1].strip())
+                        users.add(uid)
+                    except Exception:
+                        pass
+                elif "UserID:" in line:
+                    try:
+                        parts = line.split("|")
+                        for p in parts:
+                            if "UserID:" in p:
+                                uid = int(p.split(":")[1].strip())
+                                users.add(uid)
+                    except Exception:
+                        pass
+
+                # Извлекаем успешные покупки
+                if "SUCCESS_ORDER:" in line or "OrderDone:" in line:
                     p_count += 1
                     if "160" in line:
                         earned += 160
                     elif "1300" in line:
                         earned += 1300
-            
+
             total_purchases = p_count
             total_earned = earned
-            logging.info(f"Успешно загружена статистика: Покупок={p_count}, Заработано={earned}")
+            all_users = users
+            logging.info(f"[Загрузка GitHub] Юзеров: {len(all_users)}, Покупок: {p_count}, Заработано: {earned} грн")
         except Exception:
-            logging.warning("Файл заказов в GitHub пока не создан.")
+            logging.warning("Файл orders.txt еще не создан на GitHub.")
     except Exception as e:
-        logging.error(f"Ошибка чтения статистики с GitHub: {e}")
+        logging.error(f"Ошибка при считывании с GitHub: {e}")
 
-async def load_stats_from_github():
-    await asyncio.to_thread(_sync_load_stats_from_github)
+async def load_data_from_github():
+    await asyncio.to_thread(_sync_load_data_from_github)
 
 # ==================== MIDDLEWARE ПРОВЕРКИ ЮЗЕРНЕЙМА ====================
 class CheckUsernameMiddleware(BaseMiddleware):
@@ -111,7 +133,10 @@ class CheckUsernameMiddleware(BaseMiddleware):
             user = event.from_user
 
         if user:
-            all_users.add(user.id)
+            # Если пользователь новый — сохраняем его на GitHub
+            if user.id not in all_users:
+                all_users.add(user.id)
+                asyncio.create_task(append_to_github(f"USER_REGISTERED: {user.id}"))
 
             if user.id == ADMIN_ID:
                 return await handler(event, data)
@@ -192,12 +217,14 @@ def get_payment_keyboard():
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    all_users.add(message.from_user.id)
-    
+    if message.from_user.id not in all_users:
+        all_users.add(message.from_user.id)
+        await append_to_github(f"USER_REGISTERED: {message.from_user.id}")
+
     if message.from_user.id == ADMIN_ID:
         text = (
-            "👑 Вы авторизованы как Администратор!\n"
-            "Сюда будут приходить все чеки и заказы от клиентов.\n\n"
+            "👑 Вы авторизованы как Владелец бота!\n"
+            "Все новые заявки и чеки от клиентов будут приходить прямо сюда в ЛС.\n\n"
             "Выберите пункт меню ниже:"
         )
     else:
@@ -212,15 +239,16 @@ async def show_profile(message: Message):
     username_str = f"@{message.from_user.username}" if message.from_user.username else "Отсутствует"
 
     if message.from_user.id == ADMIN_ID:
+        # Панель статистики для админа (без давнего текста)
         text = (
             "👤 Профиль Администратора\n\n"
             f"👤 Имя: {message.from_user.first_name}\n"
             f"🆔 ID: {message.from_user.id}\n"
             f"🏷 Юзернейм: {username_str}\n\n"
-            f"📊 Статистика бота:\n"
+            f"📊 Статистика магазина:\n"
             f"👥 Пользователей в боте: {len(all_users)}\n"
             f"💎 Купили Premium: {total_purchases}\n"
-            f"💰 Заработано всего: {total_earned} грн"
+            f"💰 Всего заработано: {total_earned} грн"
         )
     else:
         text = (
@@ -358,6 +386,7 @@ async def process_receipt(message: Message, state: FSMContext):
     )
     await message.answer(text)
 
+    # Кнопки с жестко привязанным кодом заказа
     admin_kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -378,6 +407,7 @@ async def process_receipt(message: Message, state: FSMContext):
         f"💸 Сумма: {order_data['price_str']}"
     )
     
+    # Отправляем фото и данные администратору
     try:
         await bot.send_photo(
             chat_id=ADMIN_ID,
@@ -387,7 +417,7 @@ async def process_receipt(message: Message, state: FSMContext):
             parse_mode="Markdown"
         )
     except Exception as e:
-        logging.error(f"⚠️ Не удалось отправить чек админу: {e}")
+        logging.error(f"⚠️ Ошибка при отправке админу ({ADMIN_ID}): {e}")
 
     await state.clear()
 
@@ -399,7 +429,7 @@ async def admin_approve(call: CallbackQuery):
     order_info = active_orders.get(clean_code)
     
     if not order_info:
-        await call.answer("Заказ устарел или был обработан до перезапуска сервера.", show_alert=True)
+        await call.answer("Заказ устарел или уже был обработан.", show_alert=True)
         return
 
     target_user_id = order_info["user_id"]
@@ -409,12 +439,13 @@ async def admin_approve(call: CallbackQuery):
     price_num = order_info.get("price_num", 0)
     phone = order_info["phone"]
 
+    # Обновляем статистику
     total_purchases += 1
     total_earned += price_num
 
-    # Сохраняем информацию о заказе в GitHub
-    order_log_line = f"Заказ: {order_id} | UserID: {target_user_id} | Phone: {phone} | Item: {item} | Price: {price_str}"
-    asyncio.create_task(append_order_to_github(order_log_line))
+    # Лог сохранения успешного заказа в GitHub
+    log_line = f"SUCCESS_ORDER: {order_id} | UserID: {target_user_id} | Phone: {phone} | Item: {item} | Price: {price_num}"
+    asyncio.create_task(append_to_github(log_line))
 
     if clean_code in active_orders:
         del active_orders[clean_code]
@@ -470,11 +501,13 @@ async def admin_reject(call: CallbackQuery):
 async def main():
     logging.basicConfig(level=logging.INFO)
     
-    # Загружаем сохранённую статистику из GitHub при каждом старте бота
-    await load_stats_from_github()
+    # 1. Загружаем сохранённых пользователей и всю статистику с GitHub
+    await load_data_from_github()
     
+    # 2. Запускаем фоновый пинг
     asyncio.create_task(keep_alive())
     
+    # 3. Запуск бота
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
