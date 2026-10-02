@@ -1,2 +1,4 @@
 
 Заказ: #PremV60BCN | UserID: 8929669863 | Товар: Premium 1 месяц | Сумма: 160 грн
+
+USER_REGISTERED: 7837011810
