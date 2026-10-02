@@ -24,6 +24,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
+# Чтение ADMIN_ID из переменных или по умолчанию
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "7837011810"))
 
 CHANNEL_ID = "@Premium_Giive"
@@ -37,11 +38,11 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 
-# Базы данных в памяти
-active_orders = {}      # Активные заказы на проверке
-all_users = set()       # Множество всех уникальных ID пользователей
-total_purchases = 0     # Количество успешных покупок
-total_earned = 0        # Всего заработано грн
+# Хранилище в памяти
+active_orders = {}      # Активные заказы
+all_users = set()       # Уникальные пользователи
+total_purchases = 0     # Число покупок
+total_earned = 0        # Заработано грн
 
 # ==================== ЗАПИСЬ В GITHUB ====================
 def _sync_append_order_to_github(order_text):
@@ -63,7 +64,7 @@ def _sync_append_order_to_github(order_text):
 async def append_order_to_github(order_text):
     await asyncio.to_thread(_sync_append_order_to_github, order_text)
 
-# ==================== MIDDLEWARE ПРОВЕРКИ ЮЗЕРНЕЙМА И РЕГИСТРАЦИИ ====================
+# ==================== MIDDLEWARE ПРОВЕРКИ ЮЗЕРНЕЙМА ====================
 class CheckUsernameMiddleware(BaseMiddleware):
     async def __call__(
         self,
@@ -78,7 +79,6 @@ class CheckUsernameMiddleware(BaseMiddleware):
             user = event.from_user
 
         if user:
-            # Учитываем пользователя в общей статистике
             all_users.add(user.id)
 
             if user.id == ADMIN_ID:
@@ -161,10 +161,19 @@ def get_payment_keyboard():
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     all_users.add(message.from_user.id)
-    text = (
-        "👋 Добро пожаловать в магазин Telegram Premium!\n"
-        "Выберите интересующий пункт ниже:"
-    )
+    
+    # Если зашёл админ — выводим сообщение с подтверждением связи
+    if message.from_user.id == ADMIN_ID:
+        text = (
+            "👑 Вы авторизованы как Администратор!\n"
+            "Сюда будут приходить все чеки и заказы от клиентов.\n\n"
+            "Выберите пункт меню ниже:"
+        )
+    else:
+        text = (
+            "👋 Добро пожаловать в магазин Telegram Premium!\n"
+            "Выберите интересующий пункт ниже:"
+        )
     await message.answer(text, reply_markup=get_main_keyboard())
 
 @router.message(F.text == "👤 Профиль")
@@ -172,7 +181,6 @@ async def show_profile(message: Message):
     username_str = f"@{message.from_user.username}" if message.from_user.username else "Отсутствует"
 
     if message.from_user.id == ADMIN_ID:
-        # Статистика для Администратора в Профиле (без строки Панель Владельца)
         text = (
             "👤 Профиль Администратора\n\n"
             f"👤 Имя: {message.from_user.first_name}\n"
@@ -184,7 +192,6 @@ async def show_profile(message: Message):
             f"💰 Заработано всего: {total_earned} грн"
         )
     else:
-        # Стандартный профиль для обычных клиентов
         text = (
             "👤 Ваш профиль\n\n"
             f"🆔 ID: {message.from_user.id}\n"
@@ -320,7 +327,6 @@ async def process_receipt(message: Message, state: FSMContext):
     )
     await message.answer(text)
 
-    # Передача точного ID заказа в кнопку
     admin_kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -341,13 +347,18 @@ async def process_receipt(message: Message, state: FSMContext):
         f"💸 Сумма: {order_data['price_str']}"
     )
     
-    await bot.send_photo(
-        chat_id=ADMIN_ID,
-        photo=message.photo[-1].file_id,
-        caption=admin_text,
-        reply_markup=admin_kb,
-        parse_mode="Markdown"
-    )
+    # Отправка администратору с обработкой возможных ошибок
+    try:
+        await bot.send_photo(
+            chat_id=ADMIN_ID,
+            photo=message.photo[-1].file_id,
+            caption=admin_text,
+            reply_markup=admin_kb,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logging.error(f"⚠️ НЕ УДАЛОСЬ ОТПРАВИТЬ ЧЕК АДМИНУ ({ADMIN_ID}): {e}")
+
     await state.clear()
 
 # ==================== ОДОБРЕНИЕ И ОТКЛОНЕНИЕ ====================
@@ -368,15 +379,12 @@ async def admin_approve(call: CallbackQuery):
     price_num = order_info.get("price_num", 0)
     phone = order_info["phone"]
 
-    # Обновляем счетчики статистики
     total_purchases += 1
     total_earned += price_num
 
-    # Запись в GitHub
     order_log_line = f"Заказ: {order_id} | UserID: {target_user_id} | Phone: {phone} | Item: {item} | Price: {price_str}"
     asyncio.create_task(append_order_to_github(order_log_line))
 
-    # Удаляем из активных
     if clean_code in active_orders:
         del active_orders[clean_code]
 
@@ -393,7 +401,6 @@ async def admin_approve(call: CallbackQuery):
     except Exception:
         pass
 
-    # Публикация в канал
     duration_text = "1 месяц" if "1 месяц" in item else "1 год"
     channel_text = (
         "💎 Premium успешно выдан!\n"
