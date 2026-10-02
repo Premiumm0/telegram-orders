@@ -37,16 +37,16 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 
-# Хранилища в памяти
+# Хранилища данных в памяти
 active_orders = {}      # Заказы по clean_code
-user_orders = {}        # Заказы по user_id для гарантии поиска
+user_orders = {}        # Заказы по user_id
 all_users = set()       # Уникальные пользователи
-total_purchases = 0     # Успешных покупок
-total_earned = 0        # Заработано всего грн
+total_purchases = 0     # Количество покупок
+total_earned = 0        # Всего заработано (грн)
 
 # ==================== СИНХРОНИЗАЦИЯ С GITHUB ====================
 def _sync_append_to_github(text_line):
-    """Добавление строки в файл на GitHub"""
+    """Добавление записи в orders.txt на GitHub"""
     try:
         if not GITHUB_TOKEN:
             return
@@ -66,7 +66,7 @@ async def append_to_github(text_line):
     await asyncio.to_thread(_sync_append_to_github, text_line)
 
 def _sync_load_data_from_github():
-    """Загрузка пользователей и всей статистики из GitHub при запуске"""
+    """Считывание всей статистики и пользователей из GitHub при старте"""
     global total_purchases, total_earned, all_users
     try:
         if not GITHUB_TOKEN:
@@ -141,12 +141,12 @@ class CheckUsernameMiddleware(BaseMiddleware):
 
             if not user.username:
                 error_text = (
-                    "⚠️ **У вас не установлен Юзернейм (@username)!**\n\n"
+                    "⚠️ У вас не установлен Юзернейм (@username)!\n\n"
                     "Чтобы сделать заказ, добавьте имя пользователя (@username) в настройках Telegram, "
-                    "затем отправьте `/start`."
+                    "затем отправьте /start."
                 )
                 if isinstance(event, Message):
-                    await event.answer(error_text, parse_mode="Markdown")
+                    await event.answer(error_text)
                 elif isinstance(event, CallbackQuery):
                     await event.answer("⚠️ Установите @username в настройках Telegram!", show_alert=True)
                 return
@@ -253,7 +253,7 @@ async def show_profile(message: Message):
             f"🆔 ID: {message.from_user.id}\n"
             f"👤 Имя: {message.from_user.first_name}\n"
             f"🏷 Юзернейм: {username_str}\n"
-            f"📦 Заказов: 0"
+            f"📦 Заказов: {total_purchases}"
         )
     await message.answer(text)
 
@@ -320,11 +320,8 @@ async def process_phone(message: Message, state: FSMContext):
         "phone": phone
     }
 
-    # Сохраняем во всех словарях
     active_orders[clean_code] = order_data
     user_orders[message.from_user.id] = order_data
-    
-    # Сохраняем заказ прямо в FSM
     await state.update_data(current_order_code=clean_code, order_data=order_data)
 
     text = (
@@ -358,10 +355,9 @@ async def cancel_order(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "send_receipt")
 async def request_receipt(call: CallbackQuery, state: FSMContext):
-    # Сохраняем текущие данные FSM перед переключением состояния
     current_data = await state.get_data()
     await state.set_state(OrderFSM.waiting_for_receipt)
-    await state.update_data(**current_data)  # Переносим order_data в новое состояние
+    await state.update_data(**current_data)
     await call.message.answer("📸 Пожалуйста, отправьте фото чека об оплате:")
 
 @router.message(OrderFSM.waiting_for_receipt, F.photo)
@@ -370,7 +366,6 @@ async def process_receipt(message: Message, state: FSMContext):
     order_data = data.get("order_data")
     clean_code = data.get("current_order_code")
 
-    # Резервный поиск, если FSM пуст
     if not order_data:
         order_data = user_orders.get(message.from_user.id)
         if order_data:
@@ -402,10 +397,11 @@ async def process_receipt(message: Message, state: FSMContext):
     
     user_username = f"@{message.from_user.username}" if message.from_user.username else "Без юзернейма"
     
+    # Текст без Markdown-разметки для предотвращения ошибок с решеткой #
     admin_text = (
         "🚨 НОВЫЙ ЧЕК НА ПРОВЕРКУ!\n\n"
         f"🧾 Заказ: {order_id}\n"
-        f"👤 Пользователь: {message.from_user.full_name} ({user_username} | ID: `{message.from_user.id}`)\n"
+        f"👤 Пользователь: {message.from_user.full_name} ({user_username} | ID: {message.from_user.id})\n"
         f"📱 Товар: {order_data['item']}\n"
         f"📞 Телефон: {order_data['phone']}\n"
         f"💸 Сумма: {order_data['price_str']}"
@@ -416,11 +412,10 @@ async def process_receipt(message: Message, state: FSMContext):
             chat_id=ADMIN_ID,
             photo=message.photo[-1].file_id,
             caption=admin_text,
-            reply_markup=admin_kb,
-            parse_mode="Markdown"
+            reply_markup=admin_kb
         )
     except Exception as e:
-        logging.error(f"⚠️ Ошибка при отправке админу ({ADMIN_ID}): {e}")
+        logging.error(f"⚠️ Не удалось отправить фото администратору ({ADMIN_ID}): {e}")
 
     await state.clear()
 
@@ -479,7 +474,7 @@ async def admin_approve(call: CallbackQuery):
     except Exception as e:
         logging.error(f"Ошибка публикации в канал: {e}")
 
-    await call.message.edit_caption(caption=call.message.caption + "\n\n✅ **ОДОБРЕНО И ВЫДАНО**", reply_markup=None)
+    await call.message.edit_caption(caption=call.message.caption + "\n\n✅ ОДОБРЕНО И ВЫДАНО", reply_markup=None)
     await call.answer("Заказ одобрен!")
 
 @router.callback_query(F.data.startswith("rej_"))
@@ -499,7 +494,7 @@ async def admin_reject(call: CallbackQuery):
         if target_user_id in user_orders:
             del user_orders[target_user_id]
 
-    await call.message.edit_caption(caption=call.message.caption + "\n\n❌ **ОТКЛОНЕНО**", reply_markup=None)
+    await call.message.edit_caption(caption=call.message.caption + "\n\n❌ ОТКЛОНЕНО", reply_markup=None)
     await call.answer("Заказ отклонён.")
 
 # ==================== ЗАПУСК ====================
