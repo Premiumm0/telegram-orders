@@ -6,7 +6,7 @@ import string
 import logging
 import aiohttp
 from github import Github
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
 from aiogram.filters import CommandStart
 from aiogram.types import (
     Message, 
@@ -14,7 +14,8 @@ from aiogram.types import (
     ReplyKeyboardMarkup, 
     KeyboardButton, 
     InlineKeyboardMarkup, 
-    InlineKeyboardButton
+    InlineKeyboardButton,
+    TelegramObject
 )
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
@@ -39,6 +40,45 @@ ORDERS_FILE = "orders_db.json"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
+
+# ==================== MIDDLEWARE ДЛЯ ПРОВЕРКИ USERNAME ====================
+class CheckUsernameMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler,
+        event: TelegramObject,
+        data: dict
+    ):
+        user = None
+        if isinstance(event, Message):
+            user = event.from_user
+        elif isinstance(event, CallbackQuery):
+            user = event.from_user
+
+        if user:
+            # Проверяем наличие юзернейма у пользователя
+            if not user.username:
+                error_text = (
+                    "⚠️ **У вас не установлен Юзернейм (@username)!**\n\n"
+                    "Чтобы пользоваться ботом и оформлять заказы, вам необходимо установить юзернейм в настройках Telegram, "
+                    "чтобы администратор мог связаться с вами для выдачи товара.\n\n"
+                    "⚙️ **Как установить юзернейм:**\n"
+                    "1. Перейдите в **Настройки** Telegram.\n"
+                    "2. Нажмите **Имя пользователя** (Username).\n"
+                    "3. Придумайте и сохраните юзернейм.\n"
+                    "4. Напишите `/start` заново."
+                )
+                if isinstance(event, Message):
+                    await event.answer(error_text, parse_mode="Markdown")
+                elif isinstance(event, CallbackQuery):
+                    await event.answer("⚠️ Установите @username в настройках Telegram!", show_alert=True)
+                return
+
+        return await handler(event, data)
+
+# Подключаем Middleware ко всем входящим событиям
+router.message.outer_middleware(CheckUsernameMiddleware())
+router.callback_query.outer_middleware(CheckUsernameMiddleware())
 dp.include_router(router)
 
 # Работа с локальным сохранением JSON
@@ -182,7 +222,7 @@ async def cmd_start(message: Message, state: FSMContext):
 async def show_profile(message: Message):
     user_id = str(message.from_user.id)
     
-    # Административный профиль
+    # Для Администратора
     if message.from_user.id == ADMIN_ID:
         total_users = len(users_db)
         total_orders = sum(u.get("completed_orders", 0) for u in users_db.values())
@@ -200,12 +240,14 @@ async def show_profile(message: Message):
         await message.answer(admin_text, parse_mode="Markdown")
         return
 
-    # Обычный пользовательский профиль
+    # Для обычного пользователя
     user_data = users_db.get(user_id, {"name": message.from_user.first_name})
     text = (
         "👤 Ваш профиль\n\n"
-        f"🆔 ID: {message.from_user.id}\n\n"
-        f"👤 Имя: {user_data.get('name', 'Пользователь')}"
+        f"🆔 ID: {message.from_user.id}\n"
+        f"👤 Имя: {user_data.get('name', 'Пользователь')}\n"
+        f"🏷 Юзернейм: @{message.from_user.username}\n"
+        f"📦 Заказов: {user_data.get('completed_orders', 0)}"
     )
     await message.answer(text)
 
@@ -303,7 +345,7 @@ async def cancel_order(call: CallbackQuery, state: FSMContext):
         "Заказ был отменён."
     )
     
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ В главное меню", callback_data="back_to_main")]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️️ В главное меню", callback_data="back_to_main")]])
     await call.message.edit_text(text, reply_markup=kb)
 
 @router.callback_query(F.data == "send_receipt")
@@ -333,10 +375,12 @@ async def process_receipt(message: Message, state: FSMContext):
         ]
     )
     
+    username_str = f"@{message.from_user.username}" if message.from_user.username else "Нет юзернейма"
+    
     admin_text = (
         "🔔 Новый чек на проверку!\n\n"
         f"🧾 Заказ: {order_id}\n"
-        f"👤 Пользователь: {message.from_user.full_name} (ID: `{message.from_user.id}`)\n"
+        f"👤 Пользователь: {message.from_user.full_name} ({username_str} | ID: `{message.from_user.id}`)\n"
         f"📱 Товар: {data['item_name']}\n"
         f"📞 Номер: {data['phone']}\n"
         f"💸 Сумма: {data['price_str']}"
@@ -440,7 +484,7 @@ async def admin_reject(call: CallbackQuery):
 async def main():
     logging.basicConfig(level=logging.INFO)
     
-    # Запуск бесконечного фонового автопинга
+    # Запуск фонового автопинга
     asyncio.create_task(keep_alive())
     
     await dp.start_polling(bot)
