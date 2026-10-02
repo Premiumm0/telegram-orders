@@ -38,7 +38,8 @@ dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 
 # Хранилища в памяти
-active_orders = {}      # Заказы, ждущие проверки
+active_orders = {}      # Заказы по clean_code
+user_orders = {}        # Заказы по user_id для гарантии поиска
 all_users = set()       # Уникальные пользователи
 total_purchases = 0     # Успешных покупок
 total_earned = 0        # Заработано всего грн
@@ -81,7 +82,6 @@ def _sync_load_data_from_github():
             users = set()
 
             for line in lines:
-                # Извлекаем ID пользователей
                 if "USER_REGISTERED:" in line:
                     try:
                         uid = int(line.split(":")[1].strip())
@@ -98,7 +98,6 @@ def _sync_load_data_from_github():
                     except Exception:
                         pass
 
-                # Извлекаем успешные покупки
                 if "SUCCESS_ORDER:" in line or "OrderDone:" in line:
                     p_count += 1
                     if "160" in line:
@@ -133,7 +132,6 @@ class CheckUsernameMiddleware(BaseMiddleware):
             user = event.from_user
 
         if user:
-            # Если пользователь новый — сохраняем его на GitHub
             if user.id not in all_users:
                 all_users.add(user.id)
                 asyncio.create_task(append_to_github(f"USER_REGISTERED: {user.id}"))
@@ -239,7 +237,6 @@ async def show_profile(message: Message):
     username_str = f"@{message.from_user.username}" if message.from_user.username else "Отсутствует"
 
     if message.from_user.id == ADMIN_ID:
-        # Панель статистики для админа (без давнего текста)
         text = (
             "👤 Профиль Администратора\n\n"
             f"👤 Имя: {message.from_user.first_name}\n"
@@ -323,8 +320,12 @@ async def process_phone(message: Message, state: FSMContext):
         "phone": phone
     }
 
+    # Сохраняем во всех словарях
     active_orders[clean_code] = order_data
-    await state.update_data(current_order_code=clean_code)
+    user_orders[message.from_user.id] = order_data
+    
+    # Сохраняем заказ прямо в FSM
+    await state.update_data(current_order_code=clean_code, order_data=order_data)
 
     text = (
         "💳 Оплата заказа\n"
@@ -348,6 +349,8 @@ async def cancel_order(call: CallbackQuery, state: FSMContext):
     code = data.get("current_order_code")
     if code in active_orders:
         del active_orders[code]
+    if call.from_user.id in user_orders:
+        del user_orders[call.from_user.id]
 
     await state.clear()
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ В главное меню", callback_data="back_to_main")]])
@@ -355,21 +358,23 @@ async def cancel_order(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "send_receipt")
 async def request_receipt(call: CallbackQuery, state: FSMContext):
+    # Сохраняем текущие данные FSM перед переключением состояния
+    current_data = await state.get_data()
     await state.set_state(OrderFSM.waiting_for_receipt)
+    await state.update_data(**current_data)  # Переносим order_data в новое состояние
     await call.message.answer("📸 Пожалуйста, отправьте фото чека об оплате:")
 
 @router.message(OrderFSM.waiting_for_receipt, F.photo)
 async def process_receipt(message: Message, state: FSMContext):
     data = await state.get_data()
+    order_data = data.get("order_data")
     clean_code = data.get("current_order_code")
-    order_data = active_orders.get(clean_code)
 
+    # Резервный поиск, если FSM пуст
     if not order_data:
-        for code, ord_info in list(active_orders.items()):
-            if ord_info["user_id"] == message.from_user.id:
-                order_data = ord_info
-                clean_code = code
-                break
+        order_data = user_orders.get(message.from_user.id)
+        if order_data:
+            clean_code = order_data.get("clean_code")
 
     if not order_data:
         await message.answer("⚠️ Заказ не найден. Попробуйте оформить его заново.")
@@ -386,7 +391,6 @@ async def process_receipt(message: Message, state: FSMContext):
     )
     await message.answer(text)
 
-    # Кнопки с жестко привязанным кодом заказа
     admin_kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -407,7 +411,6 @@ async def process_receipt(message: Message, state: FSMContext):
         f"💸 Сумма: {order_data['price_str']}"
     )
     
-    # Отправляем фото и данные администратору
     try:
         await bot.send_photo(
             chat_id=ADMIN_ID,
@@ -439,16 +442,16 @@ async def admin_approve(call: CallbackQuery):
     price_num = order_info.get("price_num", 0)
     phone = order_info["phone"]
 
-    # Обновляем статистику
     total_purchases += 1
     total_earned += price_num
 
-    # Лог сохранения успешного заказа в GitHub
     log_line = f"SUCCESS_ORDER: {order_id} | UserID: {target_user_id} | Phone: {phone} | Item: {item} | Price: {price_num}"
     asyncio.create_task(append_to_github(log_line))
 
     if clean_code in active_orders:
         del active_orders[clean_code]
+    if target_user_id in user_orders:
+        del user_orders[target_user_id]
 
     user_text = (
         "🎉 Оплата подтверждена!\n"
@@ -493,6 +496,8 @@ async def admin_reject(call: CallbackQuery):
             pass
         if clean_code in active_orders:
             del active_orders[clean_code]
+        if target_user_id in user_orders:
+            del user_orders[target_user_id]
 
     await call.message.edit_caption(caption=call.message.caption + "\n\n❌ **ОТКЛОНЕНО**", reply_markup=None)
     await call.answer("Заказ отклонён.")
@@ -501,13 +506,9 @@ async def admin_reject(call: CallbackQuery):
 async def main():
     logging.basicConfig(level=logging.INFO)
     
-    # 1. Загружаем сохранённых пользователей и всю статистику с GitHub
     await load_data_from_github()
-    
-    # 2. Запускаем фоновый пинг
     asyncio.create_task(keep_alive())
     
-    # 3. Запуск бота
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
