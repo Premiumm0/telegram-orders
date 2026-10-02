@@ -28,18 +28,57 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "7837011810"))
 
 CHANNEL_ID = "@Premium_Giive"
 GITHUB_REPO_NAME = "Premiumm0/telegram-orders"
-GITHUB_FILE_PATH = "orders.txt"
+GITHUB_DB_PATH = "database.json"
 CARD_REQUISITES = "4323347356530466 (A-Bank)"
 PING_URL = "https://telegram-orders-yvf0.onrender.com/"
-
-# Файлы локальной базы данных
-USERS_FILE = "users_db.json"
-ORDERS_FILE = "orders_db.json"
 # ===================================================
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
+
+# ==================== РАБОТА С ГЛОБАЛЬНОЙ БАЗОЙ (GITHUB) ====================
+db_cache = {
+    "users": {},
+    "orders": {}
+}
+
+def _sync_load_from_github():
+    try:
+        g = Github(GITHUB_TOKEN)
+        repo = g.get_repo(GITHUB_REPO_NAME)
+        try:
+            contents = repo.get_contents(GITHUB_DB_PATH)
+            data = json.loads(contents.decoded_content.decode("utf-8"))
+            return data
+        except Exception:
+            # Если файла нет — создаем пустую структуру
+            initial_db = {"users": {}, "orders": {}}
+            repo.create_file(GITHUB_DB_PATH, "Инициализация БД", json.dumps(initial_db, ensure_ascii=False, indent=2))
+            return initial_db
+    except Exception as e:
+        logging.error(f"Ошибка загрузки БД с GitHub: {e}")
+        return {"users": {}, "orders": {}}
+
+def _sync_save_to_github(data):
+    try:
+        g = Github(GITHUB_TOKEN)
+        repo = g.get_repo(GITHUB_REPO_NAME)
+        json_str = json.dumps(data, ensure_ascii=False, indent=2)
+        try:
+            contents = repo.get_contents(GITHUB_DB_PATH)
+            repo.update_file(GITHUB_DB_PATH, "Обновление БД бота", json_str, contents.sha)
+        except Exception:
+            repo.create_file(GITHUB_DB_PATH, "Создание БД бота", json_str)
+    except Exception as e:
+        logging.error(f"Ошибка сохранения БД в GitHub: {e}")
+
+async def load_db():
+    global db_cache
+    db_cache = await asyncio.to_thread(_sync_load_from_github)
+
+async def save_db():
+    await asyncio.to_thread(_sync_save_to_github, db_cache)
 
 # ==================== MIDDLEWARE ДЛЯ ПРОВЕРКИ USERNAME ====================
 class CheckUsernameMiddleware(BaseMiddleware):
@@ -56,17 +95,16 @@ class CheckUsernameMiddleware(BaseMiddleware):
             user = event.from_user
 
         if user:
-            # Проверяем наличие юзернейма у пользователя
-            if not user.username:
+            # Не требуем username у админа
+            if user.id != ADMIN_ID and not user.username:
                 error_text = (
                     "⚠️ **У вас не установлен Юзернейм (@username)!**\n\n"
-                    "Чтобы пользоваться ботом и оформлять заказы, вам необходимо установить юзернейм в настройках Telegram, "
-                    "чтобы администратор мог связаться с вами для выдачи товара.\n\n"
-                    "⚙️ **Как установить юзернейм:**\n"
-                    "1. Перейдите в **Настройки** Telegram.\n"
-                    "2. Нажмите **Имя пользователя** (Username).\n"
-                    "3. Придумайте и сохраните юзернейм.\n"
-                    "4. Напишите `/start` заново."
+                    "Чтобы пользоваться ботом и покупать товары, вам нужно установить имя пользователя (@username) в настройках Telegram.\n\n"
+                    "⚙️ **Как добавить юзернейм:**\n"
+                    "1. Зайдите в **Настройки** Telegram.\n"
+                    "2. Нажмите **Имя пользователя**.\n"
+                    "3. Придумайте любой свободный юзернейм и сохраните.\n"
+                    "4. После этого отправьте команду `/start`."
                 )
                 if isinstance(event, Message):
                     await event.answer(error_text, parse_mode="Markdown")
@@ -76,29 +114,11 @@ class CheckUsernameMiddleware(BaseMiddleware):
 
         return await handler(event, data)
 
-# Подключаем Middleware ко всем входящим событиям
 router.message.outer_middleware(CheckUsernameMiddleware())
 router.callback_query.outer_middleware(CheckUsernameMiddleware())
 dp.include_router(router)
 
-# Работа с локальным сохранением JSON
-def load_data(filename):
-    if os.path.exists(filename):
-        try:
-            with open(filename, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-def save_data(filename, data):
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
-
-users_db = load_data(USERS_FILE)
-orders_db = load_data(ORDERS_FILE)
-
-# FSM Состояния
+# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 class OrderFSM(StatesGroup):
     waiting_for_phone = State()
     waiting_for_receipt = State()
@@ -107,58 +127,29 @@ def generate_order_id():
     chars = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
     return f"#Prem{chars}"
 
-def _sync_save_to_github(order_id: str, user_id: int, item: str, price: str):
-    try:
-        g = Github(GITHUB_TOKEN)
-        repo = g.get_repo(GITHUB_REPO_NAME)
-        
-        try:
-            contents = repo.get_contents(GITHUB_FILE_PATH)
-            current_data = contents.decoded_content.decode("utf-8")
-            sha = contents.sha
-        except Exception:
-            current_data = ""
-            sha = None
-
-        new_entry = f"Заказ: {order_id} | UserID: {user_id} | Товар: {item} | Сумма: {price}\n"
-        updated_data = current_data + new_entry
-
-        if sha:
-            repo.update_file(GITHUB_FILE_PATH, f"Добавлен заказ {order_id}", updated_data, sha)
-        else:
-            repo.create_file(GITHUB_FILE_PATH, f"Заказ {order_id}", updated_data)
-        return True
-    except Exception as e:
-        logging.error(f"Ошибка GitHub API: {e}")
-        return False
-
-async def save_order_to_github(order_id: str, user_id: int, item: str, price: str):
-    return await asyncio.to_thread(_sync_save_to_github, order_id, user_id, item, price)
-
-# Фоновая система бесконечного автопинга
 async def keep_alive():
+    """Фоновый автопинг каждые 5 минут с бесконечными повторами"""
     while True:
-        await asyncio.sleep(300)  # Каждые 5 минут
-        
+        await asyncio.sleep(300)
         success = False
-        retry_delay = 5  # Задержка при ошибках в секундах
+        retry_delay = 5
 
         while not success:
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(PING_URL, timeout=10) as response:
                         if response.status == 200:
-                            logging.info(f"[Ping OK] Сервер ответил успешно.")
+                            logging.info(f"[Ping OK] Сервер активен.")
                             success = True
                         else:
-                            logging.warning(f"[Ping {response.status}] Не удалось подключиться, пробуем снова...")
+                            logging.warning(f"[Ping Status {response.status}] Повторный пробой через {retry_delay} сек...")
             except Exception as e:
-                logging.error(f"[Ping Ошибка] {e}. Повторный пробой через {retry_delay} сек...")
+                logging.error(f"[Ping Err] {e}. Повтор через {retry_delay} сек...")
 
             if not success:
                 await asyncio.sleep(retry_delay)
 
-# Клавиатуры
+# ==================== КЛАВИАТУРЫ ====================
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -192,24 +183,25 @@ def get_payment_keyboard():
         ]
     )
 
-# Хэндлеры
+# ==================== ХЭНДЛЕРЫ ====================
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     user_id = str(message.from_user.id)
     
-    if user_id not in users_db:
-        users_db[user_id] = {
+    # Сохраняем пользователя в БД
+    if user_id not in db_cache["users"]:
+        db_cache["users"][user_id] = {
             "name": message.from_user.first_name,
-            "username": message.from_user.username,
+            "username": message.from_user.username or "",
             "completed_orders": 0,
             "spent_money": 0
         }
     else:
-        users_db[user_id]["name"] = message.from_user.first_name
-        users_db[user_id]["username"] = message.from_user.username
+        db_cache["users"][user_id]["name"] = message.from_user.first_name
+        db_cache["users"][user_id]["username"] = message.from_user.username or ""
         
-    save_data(USERS_FILE, users_db)
+    await save_db()
 
     text = (
         "👋 Добро пожаловать в магазин Telegram Premium!\n"
@@ -222,11 +214,11 @@ async def cmd_start(message: Message, state: FSMContext):
 async def show_profile(message: Message):
     user_id = str(message.from_user.id)
     
-    # Для Администратора
+    # Панель Администратора
     if message.from_user.id == ADMIN_ID:
-        total_users = len(users_db)
-        total_orders = sum(u.get("completed_orders", 0) for u in users_db.values())
-        total_revenue = sum(u.get("spent_money", 0) for u in users_db.values())
+        total_users = len(db_cache["users"])
+        total_orders = sum(u.get("completed_orders", 0) for u in db_cache["users"].values())
+        total_revenue = sum(u.get("spent_money", 0) for u in db_cache["users"].values())
         
         admin_text = (
             "👑 **Панель Администратора**\n\n"
@@ -240,13 +232,14 @@ async def show_profile(message: Message):
         await message.answer(admin_text, parse_mode="Markdown")
         return
 
-    # Для обычного пользователя
-    user_data = users_db.get(user_id, {"name": message.from_user.first_name})
+    # Профиль обычного пользователя
+    user_data = db_cache["users"].get(user_id, {"name": message.from_user.first_name, "completed_orders": 0})
+    username_str = f"@{message.from_user.username}" if message.from_user.username else "Не установлен"
     text = (
         "👤 Ваш профиль\n\n"
         f"🆔 ID: {message.from_user.id}\n"
         f"👤 Имя: {user_data.get('name', 'Пользователь')}\n"
-        f"🏷 Юзернейм: @{message.from_user.username}\n"
+        f"🏷 Юзернейм: {username_str}\n"
         f"📦 Заказов: {user_data.get('completed_orders', 0)}"
     )
     await message.answer(text)
@@ -302,7 +295,7 @@ async def process_phone(message: Message, state: FSMContext):
     order_id = generate_order_id()
     await state.update_data(phone=phone, order_id=order_id)
     
-    orders_db[order_id] = {
+    db_cache["orders"][order_id] = {
         "user_id": message.from_user.id,
         "item": data["item_name"],
         "price_str": data["price_str"],
@@ -310,7 +303,7 @@ async def process_phone(message: Message, state: FSMContext):
         "phone": phone,
         "status": "pending"
     }
-    save_data(ORDERS_FILE, orders_db)
+    await save_db()
 
     text = (
         "💳 Оплата заказа\n"
@@ -345,7 +338,7 @@ async def cancel_order(call: CallbackQuery, state: FSMContext):
         "Заказ был отменён."
     )
     
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️️ В главное меню", callback_data="back_to_main")]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ В главное меню", callback_data="back_to_main")]])
     await call.message.edit_text(text, reply_markup=kb)
 
 @router.callback_query(F.data == "send_receipt")
@@ -398,7 +391,7 @@ async def process_receipt(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("approve_"))
 async def admin_approve(call: CallbackQuery):
     order_id = call.data.split("_")[1]
-    order_info = orders_db.get(order_id)
+    order_info = db_cache["orders"].get(order_id)
     
     if not order_info:
         await call.answer("Заказ не найден.", show_alert=True)
@@ -409,22 +402,19 @@ async def admin_approve(call: CallbackQuery):
         return
 
     order_info["status"] = "approved"
-    orders_db[order_id] = order_info
-    save_data(ORDERS_FILE, orders_db)
+    db_cache["orders"][order_id] = order_info
 
     user_id = str(order_info["user_id"])
     item = order_info["item"]
     price_str = order_info["price_str"]
     price_num = order_info.get("price_num", 0)
 
-    # Сохраняем на GitHub
-    await save_order_to_github(order_id, int(user_id), item, price_str)
+    # Обновляем статистику покупателя в глобальной базе
+    if user_id in db_cache["users"]:
+        db_cache["users"][user_id]["completed_orders"] = db_cache["users"][user_id].get("completed_orders", 0) + 1
+        db_cache["users"][user_id]["spent_money"] = db_cache["users"][user_id].get("spent_money", 0) + price_num
 
-    # Обновляем статистику пользователя
-    if user_id in users_db:
-        users_db[user_id]["completed_orders"] = users_db[user_id].get("completed_orders", 0) + 1
-        users_db[user_id]["spent_money"] = users_db[user_id].get("spent_money", 0) + price_num
-        save_data(USERS_FILE, users_db)
+    await save_db()
 
     user_text = (
         "🎉 Оплата подтверждена!\n"
@@ -458,7 +448,7 @@ async def admin_approve(call: CallbackQuery):
 @router.callback_query(F.data.startswith("reject_"))
 async def admin_reject(call: CallbackQuery):
     order_id = call.data.split("_")[1]
-    order_info = orders_db.get(order_id)
+    order_info = db_cache["orders"].get(order_id)
     
     if not order_info:
         await call.answer("Заказ не найден.", show_alert=True)
@@ -469,8 +459,8 @@ async def admin_reject(call: CallbackQuery):
         return
 
     order_info["status"] = "rejected"
-    orders_db[order_id] = order_info
-    save_data(ORDERS_FILE, orders_db)
+    db_cache["orders"][order_id] = order_info
+    await save_db()
 
     user_id = str(order_info["user_id"])
     try:
@@ -484,7 +474,10 @@ async def admin_reject(call: CallbackQuery):
 async def main():
     logging.basicConfig(level=logging.INFO)
     
-    # Запуск фонового автопинга
+    # Загружаем актуальную базу данных с GitHub при старте
+    await load_db()
+    
+    # Запуск автопинга
     asyncio.create_task(keep_alive())
     
     await dp.start_polling(bot)
