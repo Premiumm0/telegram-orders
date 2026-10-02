@@ -37,16 +37,15 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 
-# Хранилища данных в памяти
+# Хранилища данных
 active_orders = {}      # Заказы по clean_code
-user_orders = {}        # Заказы по user_id
+user_orders = {}        # Последний заказ пользователя по user_id
 all_users = set()       # Уникальные пользователи
 total_purchases = 0     # Количество покупок
 total_earned = 0        # Всего заработано (грн)
 
 # ==================== СИНХРОНИЗАЦИЯ С GITHUB ====================
 def _sync_append_to_github(text_line):
-    """Добавление записи в orders.txt на GitHub"""
     try:
         if not GITHUB_TOKEN:
             return
@@ -66,7 +65,6 @@ async def append_to_github(text_line):
     await asyncio.to_thread(_sync_append_to_github, text_line)
 
 def _sync_load_data_from_github():
-    """Считывание всей статистики и пользователей из GitHub при старте"""
     global total_purchases, total_earned, all_users
     try:
         if not GITHUB_TOKEN:
@@ -108,7 +106,7 @@ def _sync_load_data_from_github():
             total_purchases = p_count
             total_earned = earned
             all_users = users
-            logging.info(f"[Загрузка GitHub] Юзеров: {len(all_users)}, Покупок: {p_count}, Заработано: {earned} грн")
+            logging.info(f"[GitHub] Загружено юзеров: {len(all_users)}, Покупок: {p_count}, Доход: {earned} грн")
         except Exception:
             logging.warning("Файл orders.txt еще не создан на GitHub.")
     except Exception as e:
@@ -167,7 +165,6 @@ def generate_order_id():
     return f"Prem{chars}"
 
 async def keep_alive():
-    """Фоновый пинг"""
     while True:
         await asyncio.sleep(300)
         try:
@@ -355,24 +352,24 @@ async def cancel_order(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "send_receipt")
 async def request_receipt(call: CallbackQuery, state: FSMContext):
-    current_data = await state.get_data()
     await state.set_state(OrderFSM.waiting_for_receipt)
-    await state.update_data(**current_data)
     await call.message.answer("📸 Пожалуйста, отправьте фото чека об оплате:")
 
-@router.message(OrderFSM.waiting_for_receipt, F.photo)
+# Универсальный обработчик отправки чека (работает с любым состоянием FSM и просто при отправке фото)
+@router.message(F.photo)
 async def process_receipt(message: Message, state: FSMContext):
     data = await state.get_data()
     order_data = data.get("order_data")
     clean_code = data.get("current_order_code")
 
+    # Поиск заказа в глобальном хранилище, если в FSM пусто
     if not order_data:
         order_data = user_orders.get(message.from_user.id)
         if order_data:
             clean_code = order_data.get("clean_code")
 
     if not order_data:
-        await message.answer("⚠️ Заказ не найден. Попробуйте оформить его заново.")
+        await message.answer("⚠️ Активный заказ не найден. Пожалуйста, оформите заказ заново через /start.")
         await state.clear()
         return
 
@@ -397,7 +394,6 @@ async def process_receipt(message: Message, state: FSMContext):
     
     user_username = f"@{message.from_user.username}" if message.from_user.username else "Без юзернейма"
     
-    # Текст без Markdown-разметки для предотвращения ошибок с решеткой #
     admin_text = (
         "🚨 НОВЫЙ ЧЕК НА ПРОВЕРКУ!\n\n"
         f"🧾 Заказ: {order_id}\n"
@@ -412,10 +408,22 @@ async def process_receipt(message: Message, state: FSMContext):
             chat_id=ADMIN_ID,
             photo=message.photo[-1].file_id,
             caption=admin_text,
-            reply_markup=admin_kb
+            reply_markup=admin_kb,
+            parse_mode=None  # Отключение форматирования для гарантированной отправки
         )
+        logging.info(f"Уведомление успешно отправлено админу {ADMIN_ID}")
     except Exception as e:
-        logging.error(f"⚠️ Не удалось отправить фото администратору ({ADMIN_ID}): {e}")
+        logging.error(f"❌ Ошибка отправки фото админу ({ADMIN_ID}): {e}")
+        # Запасная отправка текстом, если фото не прошло
+        try:
+            await bot.send_message(
+                chat_id=ADMIN_ID, 
+                text=f"⚠️ Получен новый чек, но фото не загрузилось из-за ошибки!\n\n{admin_text}",
+                reply_markup=admin_kb,
+                parse_mode=None
+            )
+        except Exception as ex:
+            logging.error(f"❌ Критическая ошибка отправки сообщения админу: {ex}")
 
     await state.clear()
 
