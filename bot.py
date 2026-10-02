@@ -1,3 +1,4 @@
+import os
 import asyncio
 import random
 import string
@@ -17,29 +18,25 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# ==================== НАСТРОЙКИ ====================
-BOT_TOKEN = "8809744925:AAGdRh7yrbNC7YW0npY5iK43zsOgd283PQk"
-ADMIN_ID = 7837011810  # Ваш числовой Telegram ID (узнать в @userinfobot)
-CHANNEL_ID = "@Premium_Giive"  # Канал для публикаций
+# ==================== НАСТРОЙКИ ИЗ СЕРВЕРА (RENDER) ====================
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "7837011810"))  # Ваш ID
 
-# Настройки GitHub
-GITHUB_TOKEN = "ВАШ_GITHUB_PERSONAL_ACCESS_TOKEN"  # Токен с правами 'repo'
-GITHUB_REPO_NAME = "Premiumm0/telegram-orders"     # Ваш репозиторий
-GITHUB_FILE_PATH = "orders.txt"                    # Файл для сохранения заказов
-
+CHANNEL_ID = "@Premium_Giive"
+GITHUB_REPO_NAME = "Premiumm0/telegram-orders"
+GITHUB_FILE_PATH = "orders.txt"
 CARD_REQUISITES = "4323347356530466 (A-Bank)"
-# ===================================================
+# =======================================================================
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 
-# Локальная база пользователей и заказов
 users_db = {} 
 orders_db = {}
 
-# FSM Состояния
 class OrderFSM(StatesGroup):
     waiting_for_phone = State()
     waiting_for_receipt = State()
@@ -73,7 +70,6 @@ def save_order_to_github(order_id: str, user_id: int, item: str, price: str):
         logging.error(f"Ошибка сохранения на GitHub: {e}")
         return False
 
-# Клавиатуры
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -95,7 +91,7 @@ def get_tariff_keyboard():
 def get_back_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="◀️️ Назад", callback_data="back_to_tariffs")]
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_tariffs")]
         ]
     )
 
@@ -107,7 +103,6 @@ def get_payment_keyboard():
         ]
     )
 
-# Хэндлеры
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
@@ -284,15 +279,12 @@ async def admin_approve(call: CallbackQuery):
     item = order_info["item"]
     price = order_info["price"]
 
-    # Сохраняем в GitHub
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, save_order_to_github, order_id, user_id, item, price)
 
-    # Пополняем счётчик профиля
     if user_id in users_db:
         users_db[user_id]["completed_orders"] += 1
 
-    # Уведомление пользователю
     user_text = (
         "🎉 Оплата подтверждена!\n"
         f"🧾 Заказ: {order_id}\n"
@@ -306,7 +298,6 @@ async def admin_approve(call: CallbackQuery):
     except Exception:
         pass
 
-    # Пост в канал
     duration_text = "1 месяц" if "1 месяц" in item else "1 год"
     channel_text = (
         "💎 Premium успешно выдан!\n"
