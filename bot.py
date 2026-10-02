@@ -37,7 +37,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 
-# Хранилище активных заказов по user_id
+# Хранилище активных заказов по clean_id (например "PremWIGZI3")
 active_orders = {}
 
 # ==================== ЗАПИСЬ В GITHUB ====================
@@ -103,7 +103,7 @@ class OrderFSM(StatesGroup):
 
 def generate_order_id():
     chars = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-    return f"#Prem{chars}"
+    return f"Prem{chars}"
 
 async def keep_alive():
     """Фоновый пинг"""
@@ -162,15 +162,23 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @router.message(F.text == "👤 Профиль")
 async def show_profile(message: Message):
-    # Одинаковый вид профиля для всех (без плашки Панель Владельца)
-    username_str = f"@{message.from_user.username}" if message.from_user.username else "Отсутствует"
-    text = (
-        "👤 Ваш профиль\n\n"
-        f"🆔 ID: {message.from_user.id}\n"
-        f"👤 Имя: {message.from_user.first_name}\n"
-        f"🏷 Юзернейм: {username_str}\n"
-        f"📦 Заказов: 0"
-    )
+    # Разделение вида профиля для Админа и Обычного пользователя
+    if message.from_user.id == ADMIN_ID:
+        text = (
+            "👑 Панель Владельца\n\n"
+            f"👤 Админ: {message.from_user.first_name}\n"
+            f"🆔 ID: {message.from_user.id}\n\n"
+            "✅ Бот работает в автономном режиме. Все заявки и чеки поступают вам в ЛС прямо сюда!"
+        )
+    else:
+        username_str = f"@{message.from_user.username}" if message.from_user.username else "Отсутствует"
+        text = (
+            "👤 Ваш профиль\n\n"
+            f"🆔 ID: {message.from_user.id}\n"
+            f"👤 Имя: {message.from_user.first_name}\n"
+            f"🏷 Юзернейм: {username_str}\n"
+            f"📦 Заказов: 0"
+        )
     await message.answer(text)
 
 @router.message(F.text == "📞 Поддержка")
@@ -221,11 +229,12 @@ async def select_tariff(call: CallbackQuery, state: FSMContext):
 async def process_phone(message: Message, state: FSMContext):
     phone = message.text.strip()
     data = await state.get_data()
-    order_id = generate_order_id()
+    clean_code = generate_order_id()
+    order_id = f"#{clean_code}"
     
-    # Сохраняем заказ в локальный словарь по user_id
-    active_orders[message.from_user.id] = {
+    order_data = {
         "order_id": order_id,
+        "clean_code": clean_code,
         "user_id": message.from_user.id,
         "username": message.from_user.username,
         "full_name": message.from_user.full_name,
@@ -234,6 +243,10 @@ async def process_phone(message: Message, state: FSMContext):
         "price_num": data.get("price_num", 160),
         "phone": phone
     }
+
+    # Сохраняем в память под ключом clean_code и по user_id
+    active_orders[clean_code] = order_data
+    await state.update_data(current_order_code=clean_code)
 
     text = (
         "💳 Оплата заказа\n"
@@ -253,9 +266,10 @@ async def process_phone(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "cancel_order")
 async def cancel_order(call: CallbackQuery, state: FSMContext):
-    user_id = call.from_user.id
-    if user_id in active_orders:
-        del active_orders[user_id]
+    data = await state.get_data()
+    code = data.get("current_order_code")
+    if code in active_orders:
+        del active_orders[code]
 
     await state.clear()
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ В главное меню", callback_data="back_to_main")]])
@@ -268,8 +282,17 @@ async def request_receipt(call: CallbackQuery, state: FSMContext):
 
 @router.message(OrderFSM.waiting_for_receipt, F.photo)
 async def process_receipt(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    order_data = active_orders.get(user_id)
+    data = await state.get_data()
+    clean_code = data.get("current_order_code")
+    order_data = active_orders.get(clean_code)
+
+    if not order_data:
+        # Резервный поиск по ID пользователя
+        for code, ord_info in list(active_orders.items()):
+            if ord_info["user_id"] == message.from_user.id:
+                order_data = ord_info
+                clean_code = code
+                break
 
     if not order_data:
         await message.answer("⚠️ Заказ не найден. Попробуйте оформить его заново.")
@@ -286,12 +309,12 @@ async def process_receipt(message: Message, state: FSMContext):
     )
     await message.answer(text)
 
-    # Кнопки админа с привязкой к ID пользователя
+    # Кнопки с явной передачей кода заказа clean_code
     admin_kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Одобрить и выдать", callback_data=f"approve_{user_id}"),
-                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user_id}")
+                InlineKeyboardButton(text="✅ Одобрить и выдать", callback_data=f"app_{clean_code}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"rej_{clean_code}")
             ]
         ]
     )
@@ -301,13 +324,12 @@ async def process_receipt(message: Message, state: FSMContext):
     admin_text = (
         "🚨 НОВЫЙ ЧЕК НА ПРОВЕРКУ!\n\n"
         f"🧾 Заказ: {order_id}\n"
-        f"👤 Пользователь: {message.from_user.full_name} ({user_username} | ID: `{user_id}`)\n"
+        f"👤 Пользователь: {message.from_user.full_name} ({user_username} | ID: `{message.from_user.id}`)\n"
         f"📱 Товар: {order_data['item']}\n"
         f"📞 Телефон: {order_data['phone']}\n"
         f"💸 Сумма: {order_data['price_str']}"
     )
     
-    # Отправляем чек ВЛАДЕЛЬЦУ
     await bot.send_photo(
         chat_id=ADMIN_ID,
         photo=message.photo[-1].file_id,
@@ -318,26 +340,28 @@ async def process_receipt(message: Message, state: FSMContext):
     await state.clear()
 
 # ==================== ОДОБРЕНИЕ И ОТКЛОНЕНИЕ ====================
-@router.callback_query(F.data.startswith("approve_"))
+@router.callback_query(F.data.startswith("app_"))
 async def admin_approve(call: CallbackQuery):
-    target_user_id = int(call.data.split("_")[1])
-    order_info = active_orders.get(target_user_id)
+    clean_code = call.data.split("_")[1]
+    order_info = active_orders.get(clean_code)
     
     if not order_info:
-        await call.answer("Заказ не найден или уже был обработан.", show_alert=True) #[cite: 14]
+        await call.answer("Заказ устарел или уже был обработан.", show_alert=True)
         return
 
+    target_user_id = order_info["user_id"]
     order_id = order_info["order_id"]
     item = order_info["item"]
     price_str = order_info["price_str"]
     phone = order_info["phone"]
 
-    # Сохраняем историю в GitHub
+    # Логирование
     order_log_line = f"Заказ: {order_id} | UserID: {target_user_id} | Phone: {phone} | Item: {item} | Price: {price_str}"
     asyncio.create_task(append_order_to_github(order_log_line))
 
-    # Удаляем из активных
-    del active_orders[target_user_id]
+    # Удаляем из памяти
+    if clean_code in active_orders:
+        del active_orders[clean_code]
 
     user_text = (
         "🎉 Оплата подтверждена!\n"
@@ -369,18 +393,20 @@ async def admin_approve(call: CallbackQuery):
     await call.message.edit_caption(caption=call.message.caption + "\n\n✅ **ОДОБРЕНО И ВЫДАНО**", reply_markup=None)
     await call.answer("Заказ одобрен!")
 
-@router.callback_query(F.data.startswith("reject_"))
+@router.callback_query(F.data.startswith("rej_"))
 async def admin_reject(call: CallbackQuery):
-    target_user_id = int(call.data.split("_")[1])
-    order_info = active_orders.get(target_user_id)
+    clean_code = call.data.split("_")[1]
+    order_info = active_orders.get(clean_code)
 
     if order_info:
+        target_user_id = order_info["user_id"]
         order_id = order_info["order_id"]
         try:
             await bot.send_message(chat_id=target_user_id, text=f"❌ Ваш заказ {order_id} был отменён администратором.")
         except Exception:
             pass
-        del active_orders[target_user_id]
+        if clean_code in active_orders:
+            del active_orders[clean_code]
 
     await call.message.edit_caption(caption=call.message.caption + "\n\n❌ **ОТКЛОНЕНО**", reply_markup=None)
     await call.answer("Заказ отклонён.")
