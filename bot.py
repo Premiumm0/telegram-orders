@@ -37,8 +37,11 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 
-# Хранилище активных заказов по clean_id (например "PremWIGZI3")
-active_orders = {}
+# Базы данных в памяти
+active_orders = {}      # Активные заказы на проверке
+all_users = set()       # Множество всех уникальных ID пользователей
+total_purchases = 0     # Количество успешных покупок
+total_earned = 0        # Всего заработано грн
 
 # ==================== ЗАПИСЬ В GITHUB ====================
 def _sync_append_order_to_github(order_text):
@@ -60,7 +63,7 @@ def _sync_append_order_to_github(order_text):
 async def append_order_to_github(order_text):
     await asyncio.to_thread(_sync_append_order_to_github, order_text)
 
-# ==================== MIDDLEWARE ПРОВЕРКИ ЮЗЕРНЕЙМА ====================
+# ==================== MIDDLEWARE ПРОВЕРКИ ЮЗЕРНЕЙМА И РЕГИСТРАЦИИ ====================
 class CheckUsernameMiddleware(BaseMiddleware):
     async def __call__(
         self,
@@ -75,6 +78,9 @@ class CheckUsernameMiddleware(BaseMiddleware):
             user = event.from_user
 
         if user:
+            # Учитываем пользователя в общей статистике
+            all_users.add(user.id)
+
             if user.id == ADMIN_ID:
                 return await handler(event, data)
 
@@ -154,6 +160,7 @@ def get_payment_keyboard():
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
+    all_users.add(message.from_user.id)
     text = (
         "👋 Добро пожаловать в магазин Telegram Premium!\n"
         "Выберите интересующий пункт ниже:"
@@ -162,16 +169,22 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @router.message(F.text == "👤 Профиль")
 async def show_profile(message: Message):
-    # Разделение вида профиля для Админа и Обычного пользователя
+    username_str = f"@{message.from_user.username}" if message.from_user.username else "Отсутствует"
+
     if message.from_user.id == ADMIN_ID:
+        # Статистика для Администратора в Профиле (без строки Панель Владельца)
         text = (
-            "👑 Панель Владельца\n\n"
-            f"👤 Админ: {message.from_user.first_name}\n"
-            f"🆔 ID: {message.from_user.id}\n\n"
-            "✅ Бот работает в автономном режиме. Все заявки и чеки поступают вам в ЛС прямо сюда!"
+            "👤 Профиль Администратора\n\n"
+            f"👤 Имя: {message.from_user.first_name}\n"
+            f"🆔 ID: {message.from_user.id}\n"
+            f"🏷 Юзернейм: {username_str}\n\n"
+            f"📊 Статистика бота:\n"
+            f"👥 Пользователей в боте: {len(all_users)}\n"
+            f"💎 Купили Premium: {total_purchases}\n"
+            f"💰 Заработано всего: {total_earned} грн"
         )
     else:
-        username_str = f"@{message.from_user.username}" if message.from_user.username else "Отсутствует"
+        # Стандартный профиль для обычных клиентов
         text = (
             "👤 Ваш профиль\n\n"
             f"🆔 ID: {message.from_user.id}\n"
@@ -244,7 +257,6 @@ async def process_phone(message: Message, state: FSMContext):
         "phone": phone
     }
 
-    # Сохраняем в память под ключом clean_code и по user_id
     active_orders[clean_code] = order_data
     await state.update_data(current_order_code=clean_code)
 
@@ -287,7 +299,6 @@ async def process_receipt(message: Message, state: FSMContext):
     order_data = active_orders.get(clean_code)
 
     if not order_data:
-        # Резервный поиск по ID пользователя
         for code, ord_info in list(active_orders.items()):
             if ord_info["user_id"] == message.from_user.id:
                 order_data = ord_info
@@ -309,7 +320,7 @@ async def process_receipt(message: Message, state: FSMContext):
     )
     await message.answer(text)
 
-    # Кнопки с явной передачей кода заказа clean_code
+    # Передача точного ID заказа в кнопку
     admin_kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -342,6 +353,7 @@ async def process_receipt(message: Message, state: FSMContext):
 # ==================== ОДОБРЕНИЕ И ОТКЛОНЕНИЕ ====================
 @router.callback_query(F.data.startswith("app_"))
 async def admin_approve(call: CallbackQuery):
+    global total_purchases, total_earned
     clean_code = call.data.split("_")[1]
     order_info = active_orders.get(clean_code)
     
@@ -353,13 +365,18 @@ async def admin_approve(call: CallbackQuery):
     order_id = order_info["order_id"]
     item = order_info["item"]
     price_str = order_info["price_str"]
+    price_num = order_info.get("price_num", 0)
     phone = order_info["phone"]
 
-    # Логирование
+    # Обновляем счетчики статистики
+    total_purchases += 1
+    total_earned += price_num
+
+    # Запись в GitHub
     order_log_line = f"Заказ: {order_id} | UserID: {target_user_id} | Phone: {phone} | Item: {item} | Price: {price_str}"
     asyncio.create_task(append_order_to_github(order_log_line))
 
-    # Удаляем из памяти
+    # Удаляем из активных
     if clean_code in active_orders:
         del active_orders[clean_code]
 
