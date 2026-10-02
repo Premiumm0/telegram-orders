@@ -18,8 +18,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
 # ==================== НАСТРОЙКИ ====================
-BOT_TOKEN = "ВАШ_BOT_TOKEN_ОТ_BOTFATHER"
-ADMIN_ID = 123456789  # Ваш числовой Telegram ID (узнать в @userinfobot)
+BOT_TOKEN = "8809744925:AAGdRh7yrbNC7YW0npY5iK43zsOgd283PQk"
+ADMIN_ID = 7837011810  # Ваш числовой Telegram ID (узнать в @userinfobot)
 CHANNEL_ID = "@Premium_Giive"  # Канал для публикаций
 
 # Настройки GitHub
@@ -27,7 +27,7 @@ GITHUB_TOKEN = "ВАШ_GITHUB_PERSONAL_ACCESS_TOKEN"  # Токен с права
 GITHUB_REPO_NAME = "Premiumm0/telegram-orders"     # Ваш репозиторий
 GITHUB_FILE_PATH = "orders.txt"                    # Файл для сохранения заказов
 
-CARD_REQUISITES = "4441 1111 2222 3333 (MonoBank)"
+CARD_REQUISITES = "4323347356530466 (A-Bank)"
 # ===================================================
 
 bot = Bot(token=BOT_TOKEN)
