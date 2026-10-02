@@ -1,8 +1,10 @@
 import os
+import json
 import asyncio
 import random
 import string
 import logging
+import aiohttp
 from github import Github
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart
@@ -18,25 +20,45 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# ==================== НАСТРОЙКИ ИЗ СЕРВЕРА (RENDER) ====================
+# ==================== НАСТРОЙКИ ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "7837011810"))  # Ваш ID
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "7837011810"))
 
 CHANNEL_ID = "@Premium_Giive"
 GITHUB_REPO_NAME = "Premiumm0/telegram-orders"
 GITHUB_FILE_PATH = "orders.txt"
 CARD_REQUISITES = "4323347356530466 (A-Bank)"
-# =======================================================================
+PING_URL = "https://telegram-orders-yvf0.onrender.com/"
+
+# Файлы локальной базы данных
+USERS_FILE = "users_db.json"
+ORDERS_FILE = "orders_db.json"
+# ===================================================
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 
-users_db = {} 
-orders_db = {}
+# Работа с локальным сохранением JSON
+def load_data(filename):
+    if os.path.exists(filename):
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
 
+def save_data(filename, data):
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+
+users_db = load_data(USERS_FILE)
+orders_db = load_data(ORDERS_FILE)
+
+# FSM Состояния
 class OrderFSM(StatesGroup):
     waiting_for_phone = State()
     waiting_for_receipt = State()
@@ -45,7 +67,7 @@ def generate_order_id():
     chars = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
     return f"#Prem{chars}"
 
-def save_order_to_github(order_id: str, user_id: int, item: str, price: str):
+def _sync_save_to_github(order_id: str, user_id: int, item: str, price: str):
     try:
         g = Github(GITHUB_TOKEN)
         repo = g.get_repo(GITHUB_REPO_NAME)
@@ -67,9 +89,36 @@ def save_order_to_github(order_id: str, user_id: int, item: str, price: str):
             repo.create_file(GITHUB_FILE_PATH, f"Заказ {order_id}", updated_data)
         return True
     except Exception as e:
-        logging.error(f"Ошибка сохранения на GitHub: {e}")
+        logging.error(f"Ошибка GitHub API: {e}")
         return False
 
+async def save_order_to_github(order_id: str, user_id: int, item: str, price: str):
+    return await asyncio.to_thread(_sync_save_to_github, order_id, user_id, item, price)
+
+# Фоновая система бесконечного автопинга
+async def keep_alive():
+    while True:
+        await asyncio.sleep(300)  # Каждые 5 минут
+        
+        success = False
+        retry_delay = 5  # Задержка при ошибках в секундах
+
+        while not success:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(PING_URL, timeout=10) as response:
+                        if response.status == 200:
+                            logging.info(f"[Ping OK] Сервер ответил успешно.")
+                            success = True
+                        else:
+                            logging.warning(f"[Ping {response.status}] Не удалось подключиться, пробуем снова...")
+            except Exception as e:
+                logging.error(f"[Ping Ошибка] {e}. Повторный пробой через {retry_delay} сек...")
+
+            if not success:
+                await asyncio.sleep(retry_delay)
+
+# Клавиатуры
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -103,16 +152,25 @@ def get_payment_keyboard():
         ]
     )
 
+# Хэндлеры
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    user_id = message.from_user.id
+    user_id = str(message.from_user.id)
+    
     if user_id not in users_db:
         users_db[user_id] = {
             "name": message.from_user.first_name,
-            "completed_orders": 0
+            "username": message.from_user.username,
+            "completed_orders": 0,
+            "spent_money": 0
         }
-    
+    else:
+        users_db[user_id]["name"] = message.from_user.first_name
+        users_db[user_id]["username"] = message.from_user.username
+        
+    save_data(USERS_FILE, users_db)
+
     text = (
         "👋 Добро пожаловать в магазин Telegram Premium!\n"
         "Здесь ты можешь быстро приобрести Premium на свой аккаунт.\n\n"
@@ -122,14 +180,32 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @router.message(F.text == "👤 Профиль")
 async def show_profile(message: Message):
-    user_id = message.from_user.id
-    user_data = users_db.get(user_id, {"name": message.from_user.first_name, "completed_orders": 0})
+    user_id = str(message.from_user.id)
     
+    # Административный профиль
+    if message.from_user.id == ADMIN_ID:
+        total_users = len(users_db)
+        total_orders = sum(u.get("completed_orders", 0) for u in users_db.values())
+        total_revenue = sum(u.get("spent_money", 0) for u in users_db.values())
+        
+        admin_text = (
+            "👑 **Панель Администратора**\n\n"
+            f"👤 **Имя:** {message.from_user.first_name}\n"
+            f"🆔 **ID:** `{message.from_user.id}`\n\n"
+            f"📊 **Статистика бота:**\n"
+            f"👥 Пользователей в боте: **{total_users}**\n"
+            f"💎 Куплено Premium: **{total_orders}**\n"
+            f"💰 Общая выручка: **{total_revenue} грн**"
+        )
+        await message.answer(admin_text, parse_mode="Markdown")
+        return
+
+    # Обычный пользовательский профиль
+    user_data = users_db.get(user_id, {"name": message.from_user.first_name})
     text = (
         "👤 Ваш профиль\n\n"
-        f"🆔 ID: {user_id}\n\n"
-        f"👤 Имя: {user_data['name']}\n\n"
-        f"📦 Заказов: {user_data['completed_orders']}"
+        f"🆔 ID: {message.from_user.id}\n\n"
+        f"👤 Имя: {user_data.get('name', 'Пользователь')}"
     )
     await message.answer(text)
 
@@ -144,7 +220,10 @@ async def buy_premium_menu(message: Message):
 @router.callback_query(F.data == "back_to_main")
 async def back_to_main(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    await call.message.delete()
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
     await call.message.answer("💎 Выберите действие:", reply_markup=get_main_keyboard())
 
 @router.callback_query(F.data == "back_to_tariffs")
@@ -156,12 +235,14 @@ async def back_to_tariffs(call: CallbackQuery, state: FSMContext):
 async def select_tariff(call: CallbackQuery, state: FSMContext):
     if call.data == "buy_1_month":
         item_name = "Premium 1 месяц"
-        price = "160 грн"
+        price_num = 160
+        price_str = "160 грн"
     else:
         item_name = "Premium 1 год"
-        price = "1300 грн"
+        price_num = 1300
+        price_str = "1300 грн"
 
-    await state.update_data(item_name=item_name, price=price)
+    await state.update_data(item_name=item_name, price_str=price_str, price_num=price_num)
     await state.set_state(OrderFSM.waiting_for_phone)
 
     text = (
@@ -182,16 +263,19 @@ async def process_phone(message: Message, state: FSMContext):
     orders_db[order_id] = {
         "user_id": message.from_user.id,
         "item": data["item_name"],
-        "price": data["price"],
-        "phone": phone
+        "price_str": data["price_str"],
+        "price_num": data["price_num"],
+        "phone": phone,
+        "status": "pending"
     }
+    save_data(ORDERS_FILE, orders_db)
 
     text = (
         "💳 Оплата заказа\n"
         f"🧾 Заказ: {order_id}\n"
         f"📱 Товар: {data['item_name']}\n"
         f"📞 Номер: {phone}\n"
-        f"💸 Стоимость: {data['price']}\n"
+        f"💸 Стоимость: {data['price_str']}\n"
         "🏦 Банк: MonoBank\n"
         f"💳 Карта: {CARD_REQUISITES}\n\n"
         "💛 Оплатите заказ по реквизитам выше.\n"
@@ -207,7 +291,7 @@ async def cancel_order(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     order_id = data.get("order_id", "#Prem000000")
     item = data.get("item_name", "Premium 1 месяц")
-    price = data.get("price", "160 грн")
+    price = data.get("price_str", "160 грн")
 
     await state.clear()
     
@@ -252,17 +336,18 @@ async def process_receipt(message: Message, state: FSMContext):
     admin_text = (
         "🔔 Новый чек на проверку!\n\n"
         f"🧾 Заказ: {order_id}\n"
-        f"👤 Пользователь: {message.from_user.full_name} (ID: {message.from_user.id})\n"
+        f"👤 Пользователь: {message.from_user.full_name} (ID: `{message.from_user.id}`)\n"
         f"📱 Товар: {data['item_name']}\n"
         f"📞 Номер: {data['phone']}\n"
-        f"💸 Сумма: {data['price']}"
+        f"💸 Сумма: {data['price_str']}"
     )
     
     await bot.send_photo(
         chat_id=ADMIN_ID,
         photo=message.photo[-1].file_id,
         caption=admin_text,
-        reply_markup=admin_kb
+        reply_markup=admin_kb,
+        parse_mode="Markdown"
     )
     await state.clear()
 
@@ -275,26 +360,38 @@ async def admin_approve(call: CallbackQuery):
         await call.answer("Заказ не найден.", show_alert=True)
         return
 
-    user_id = order_info["user_id"]
+    if order_info.get("status") == "approved":
+        await call.answer("Этот заказ уже одобрен!", show_alert=True)
+        return
+
+    order_info["status"] = "approved"
+    orders_db[order_id] = order_info
+    save_data(ORDERS_FILE, orders_db)
+
+    user_id = str(order_info["user_id"])
     item = order_info["item"]
-    price = order_info["price"]
+    price_str = order_info["price_str"]
+    price_num = order_info.get("price_num", 0)
 
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, save_order_to_github, order_id, user_id, item, price)
+    # Сохраняем на GitHub
+    await save_order_to_github(order_id, int(user_id), item, price_str)
 
+    # Обновляем статистику пользователя
     if user_id in users_db:
-        users_db[user_id]["completed_orders"] += 1
+        users_db[user_id]["completed_orders"] = users_db[user_id].get("completed_orders", 0) + 1
+        users_db[user_id]["spent_money"] = users_db[user_id].get("spent_money", 0) + price_num
+        save_data(USERS_FILE, users_db)
 
     user_text = (
         "🎉 Оплата подтверждена!\n"
         f"🧾 Заказ: {order_id}\n"
         f"📱 Товар: {item}\n"
-        f"💰 Стоимость: {price}\n"
+        f"💰 Стоимость: {price_str}\n"
         "🔄 Заказ передан в обработку.\n"
         "⏳ Ожидайте выполнения заказа."
     )
     try:
-        await bot.send_message(chat_id=user_id, text=user_text)
+        await bot.send_message(chat_id=int(user_id), text=user_text)
     except Exception:
         pass
 
@@ -303,32 +400,49 @@ async def admin_approve(call: CallbackQuery):
         "💎 Premium успешно выдан!\n"
         f"🧾 Номер заказа: {order_id}\n"
         f"💎 Premium: {duration_text}\n"
-        f"💰 Стоимость: {price}\n"
+        f"💰 Стоимость: {price_str}\n"
         "✅ Заказ успешно выполнен!"
     )
     try:
         await bot.send_message(chat_id=CHANNEL_ID, text=channel_text)
     except Exception as e:
-        logging.error(f"Ошибка канала: {e}")
+        logging.error(f"Ошибка публикации в канал: {e}")
 
-    await call.message.edit_caption(caption=call.message.caption + "\n\n✅ **ОДОБРЕНО**")
+    await call.message.edit_caption(caption=call.message.caption + "\n\n✅ **ОДОБРЕНО**", reply_markup=None)
+    await call.answer("Заказ успешно одобрен!")
 
 @router.callback_query(F.data.startswith("reject_"))
 async def admin_reject(call: CallbackQuery):
     order_id = call.data.split("_")[1]
     order_info = orders_db.get(order_id)
     
-    if order_info:
-        user_id = order_info["user_id"]
-        try:
-            await bot.send_message(chat_id=user_id, text=f"❌ Ваш заказ {order_id} был отменён администратором.")
-        except Exception:
-            pass
+    if not order_info:
+        await call.answer("Заказ не найден.", show_alert=True)
+        return
 
-    await call.message.edit_caption(caption=call.message.caption + "\n\n❌ **ОТКЛОНЕНО**")
+    if order_info.get("status") == "rejected":
+        await call.answer("Этот заказ уже отклонен!", show_alert=True)
+        return
+
+    order_info["status"] = "rejected"
+    orders_db[order_id] = order_info
+    save_data(ORDERS_FILE, orders_db)
+
+    user_id = str(order_info["user_id"])
+    try:
+        await bot.send_message(chat_id=int(user_id), text=f"❌ Ваш заказ {order_id} был отменён администратором.")
+    except Exception:
+        pass
+
+    await call.message.edit_caption(caption=call.message.caption + "\n\n❌ **ОТКЛОНЕНО**", reply_markup=None)
+    await call.answer("Заказ отклонён.")
 
 async def main():
     logging.basicConfig(level=logging.INFO)
+    
+    # Запуск бесконечного фонового автопинга
+    asyncio.create_task(keep_alive())
+    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
