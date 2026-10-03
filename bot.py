@@ -50,7 +50,7 @@ def _load_json_from_github(filepath: str) -> dict:
         content_str = contents.decoded_content.decode("utf-8")
         return json.loads(content_str)
     except Exception as e:
-        logging.warning(f"Не удалось загрузить {filepath} из GitHub (будет создан новый): {e}")
+        logging.warning(f"Не удалось загрузить {filepath} из GitHub: {e}")
         return {}
 
 def _save_json_to_github(filepath: str, data: dict):
@@ -177,6 +177,12 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     user_id = str(message.from_user.id)
     
+    # Загружаем свежие данные перед записью
+    global users_db
+    latest_db = await load_db_async(USERS_GITHUB_PATH)
+    if latest_db:
+        users_db = latest_db
+
     if user_id not in users_db:
         users_db[user_id] = {
             "name": message.from_user.first_name,
@@ -201,6 +207,22 @@ async def cmd_start(message: Message, state: FSMContext):
 async def show_profile(message: Message):
     user_id = str(message.from_user.id)
     
+    # Синхронизация с GitHub перед показом профиля
+    global users_db
+    latest_db = await load_db_async(USERS_GITHUB_PATH)
+    if latest_db:
+        users_db = latest_db
+
+    user_data = users_db.get(user_id, {
+        "name": message.from_user.first_name,
+        "completed_orders": 0,
+        "spent_money": 0
+    })
+    
+    completed_orders = user_data.get("completed_orders", 0)
+    spent_money = user_data.get("spent_money", 0)
+
+    # Панель Администратора
     if message.from_user.id == ADMIN_ID:
         total_users = len(users_db)
         total_orders = sum(u.get("completed_orders", 0) for u in users_db.values())
@@ -210,19 +232,25 @@ async def show_profile(message: Message):
             "👑 <b>Панель Администратора</b>\n\n"
             f"👤 <b>Имя:</b> {message.from_user.first_name}\n"
             f"🆔 <b>ID:</b> <code>{message.from_user.id}</code>\n\n"
-            f"📊 <b>Статистика бота:</b>\n"
+            f"📊 <b>Общая статистика бота:</b>\n"
             f"👥 Пользователей в боте: <b>{total_users}</b>\n"
             f"💎 Куплено Premium: <b>{total_orders}</b>\n"
-            f"💰 Общая выручка: <b>{total_revenue} грн</b>"
+            f"💰 Общая выручка: <b>{total_revenue} грн</b>\n\n"
+            f"👤 <b>Ваши личные покупки:</b>\n"
+            f"💎 Куплено Premium: <b>{completed_orders}</b>\n"
+            f"💰 Потрачено: <b>{spent_money} грн</b>"
         )
         await message.answer(admin_text, parse_mode="HTML")
         return
 
-    user_data = users_db.get(user_id, {"name": message.from_user.first_name})
+    # Профиль стандартного пользователя
     text = (
         "👤 <b>Ваш профиль</b>\n\n"
         f"🆔 <b>ID:</b> <code>{message.from_user.id}</code>\n"
-        f"👤 <b>Имя:</b> {user_data.get('name', 'Пользователь')}"
+        f"👤 <b>Имя:</b> {user_data.get('name', 'Пользователь')}\n\n"
+        f"📊 <b>Ваша статистика:</b>\n"
+        f"💎 Куплено Premium: <b>{completed_orders}</b>\n"
+        f"💰 Потрачено всего: <b>{spent_money} грн</b>"
     )
     await message.answer(text, parse_mode="HTML")
 
@@ -398,14 +426,26 @@ async def admin_approve(call: CallbackQuery):
     price_str = order_info["price_str"]
     price_num = order_info.get("price_num", 0)
 
-    # Запись текстового лога в GitHub (orders.txt)
+    # Сохранение заказа в текстовый файл orders.txt
     await save_order_to_github_txt(order_id, int(user_id), username, phone, item, price_str)
 
-    # Обновление статистики пользователя
-    if user_id in users_db:
-        users_db[user_id]["completed_orders"] = users_db[user_id].get("completed_orders", 0) + 1
-        users_db[user_id]["spent_money"] = users_db[user_id].get("spent_money", 0) + price_num
-        await save_db_async(USERS_GITHUB_PATH, users_db)
+    # Обновление свежей базы перед сохранением
+    global users_db
+    latest_db = await load_db_async(USERS_GITHUB_PATH)
+    if latest_db:
+        users_db = latest_db
+
+    if user_id not in users_db:
+        users_db[user_id] = {
+            "name": order_info.get("full_name", "Пользователь"),
+            "username": username,
+            "completed_orders": 0,
+            "spent_money": 0
+        }
+        
+    users_db[user_id]["completed_orders"] = users_db[user_id].get("completed_orders", 0) + 1
+    users_db[user_id]["spent_money"] = users_db[user_id].get("spent_money", 0) + price_num
+    await save_db_async(USERS_GITHUB_PATH, users_db)
 
     user_text = (
         "🎉 <b>Оплата подтверждена!</b>\n\n"
