@@ -8,5 +8,15 @@
         "price_num": 160,
         "phone": "202938",
         "status": "approved"
+    },
+    "#PremAJL3Z5": {
+        "user_id": 8661283656,
+        "username": "arte_shik",
+        "full_name": "Артем",
+        "item": "Premium 1 месяц",
+        "price_str": "160 грн",
+        "price_num": 160,
+        "phone": "+3805844848",
+        "status": "pending"
     }
 }
