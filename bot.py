@@ -23,12 +23,12 @@ from aiogram.fsm.storage.memory import MemoryStorage
 # ==================== НАСТРОЙКИ ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "8661283656"))
+ADMIN_ID = 8661283656
 
 CHANNEL_ID = "@Premium_Giive"
 GITHUB_REPO_NAME = "Premiumm0/telegram-orders"
 GITHUB_FILE_PATH = "orders.txt"
-CARD_REQUISITES = "4323347356530466 (A-Bank)"
+CARD_REQUISITES = "4323 3473 5653 0466 (A-Bank)"
 
 USERS_FILE = "users_db.json"
 ORDERS_FILE = "orders_db.json"
@@ -56,7 +56,6 @@ async def keep_alive():
     """Фоновое поддержание активности (15 минут)"""
     while True:
         await asyncio.sleep(900)
-        # Внутренний интервал безопасен для работы
 
 # --- База данных JSON ---
 def load_data(filename):
@@ -84,7 +83,7 @@ def generate_order_id():
     chars = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
     return f"#Prem{chars}"
 
-def _sync_save_to_github(order_id: str, user_id: int, item: str, price: str):
+def _sync_save_to_github(order_id: str, user_id: int, username: str, phone: str, item: str, price: str):
     try:
         if not GITHUB_TOKEN:
             return False
@@ -99,7 +98,8 @@ def _sync_save_to_github(order_id: str, user_id: int, item: str, price: str):
             current_data = ""
             sha = None
 
-        new_entry = f"Заказ: {order_id} | UserID: {user_id} | Товар: {item} | Сумма: {price}\n"
+        user_str = f"@{username}" if username else "no_username"
+        new_entry = f"Заказ: {order_id} | UserID: {user_id} | Username: {user_str} | Телефон: {phone} | Товар: {item} | Сумма: {price}\n"
         updated_data = current_data + new_entry
 
         if sha:
@@ -111,8 +111,8 @@ def _sync_save_to_github(order_id: str, user_id: int, item: str, price: str):
         logging.error(f"Ошибка GitHub API: {e}")
         return False
 
-async def save_order_to_github(order_id: str, user_id: int, item: str, price: str):
-    return await asyncio.to_thread(_sync_save_to_github, order_id, user_id, item, price)
+async def save_order_to_github(order_id: str, user_id: int, username: str, phone: str, item: str, price: str):
+    return await asyncio.to_thread(_sync_save_to_github, order_id, user_id, username, phone, item, price)
 
 # Клавиатуры
 def get_main_keyboard():
@@ -258,6 +258,8 @@ async def process_phone(message: Message, state: FSMContext):
     
     orders_db[order_id] = {
         "user_id": message.from_user.id,
+        "username": message.from_user.username,
+        "full_name": message.from_user.full_name,
         "item": data["item_name"],
         "price_str": data["price_str"],
         "price_num": data["price_num"],
@@ -266,7 +268,6 @@ async def process_phone(message: Message, state: FSMContext):
     }
     save_data(ORDERS_FILE, orders_db)
 
-    # Защищённый блок с HTML-цитатами для обохода авто-банов
     text = (
         "<b>💳 Оплата заказа</b>\n\n"
         f"<blockquote>Заказ: {order_id}\n"
@@ -274,7 +275,7 @@ async def process_phone(message: Message, state: FSMContext):
         f"Номер: {phone}\n"
         f"Стоимость: {data['price_str']}</blockquote>\n\n"
         "<b>💳 Реквизиты для перевода</b>\n\n"
-        f"<blockquote>• Банк: MonoBank\n"
+        f"<blockquote>• Банк: A-Bank\n"
         f"• Реквизиты: {CARD_REQUISITES}</blockquote>\n\n"
         "<b>📌 Инструкция:</b>\n"
         "<blockquote>1. Выполните перевод по реквизитам выше.\n"
@@ -329,16 +330,20 @@ async def process_receipt(message: Message, state: FSMContext):
         ]
     )
     
+    username_str = f"@{message.from_user.username}" if message.from_user.username else "Нет юзернейма"
+    
     admin_text = (
         "🔔 <b>Новый чек на проверку!</b>\n\n"
         f"<blockquote>Заказ: {order_id}\n"
-        f"Пользователь: {message.from_user.full_name} (ID: {message.from_user.id})\n"
+        f"Пользователь: {message.from_user.full_name}\n"
+        f"Юзернейм: {username_str}\n"
+        f"ID: {message.from_user.id}\n"
         f"Товар: {data.get('item_name', 'Premium')}\n"
         f"Номер: {data.get('phone', 'Не указан')}\n"
         f"Сумма: {data.get('price_str', '160 грн')}</blockquote>"
     )
     
-    await asyncio.sleep(1)  # Анти-флуд задержка
+    await asyncio.sleep(1)
     await bot.send_photo(
         chat_id=ADMIN_ID,
         photo=message.photo[-1].file_id,
@@ -366,12 +371,14 @@ async def admin_approve(call: CallbackQuery):
     save_data(ORDERS_FILE, orders_db)
 
     user_id = str(order_info["user_id"])
+    username = order_info.get("username", "")
+    phone = order_info.get("phone", "")
     item = order_info["item"]
     price_str = order_info["price_str"]
     price_num = order_info.get("price_num", 0)
 
     # Сохранение заказа в GitHub
-    await save_order_to_github(order_id, int(user_id), item, price_str)
+    await save_order_to_github(order_id, int(user_id), username, phone, item, price_str)
 
     # Обновление статистики пользователя
     if user_id in users_db:
@@ -436,7 +443,6 @@ async def admin_reject(call: CallbackQuery):
 
 async def main():
     logging.basicConfig(level=logging.INFO)
-    # Запуск микро веб-сервера для Render
     asyncio.create_task(start_web_server())
     asyncio.create_task(keep_alive())
     
