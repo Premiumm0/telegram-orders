@@ -1,226 +1,445 @@
 import os
+import json
 import asyncio
-import aiohttp
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import CommandStart
+import random
+import string
+import logging
+from github import Github
+from aiohttp import web
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import CommandStart, Command
+from aiogram.types import (
+    Message, 
+    CallbackQuery, 
+    ReplyKeyboardMarkup, 
+    KeyboardButton, 
+    InlineKeyboardMarkup, 
+    InlineKeyboardButton
+)
+from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# ================= КОНФИГУРАЦИЯ =================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "8661283656"))  # Ваш Telegram ID
+# ==================== НАСТРОЙКИ ====================
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "8661283656"))
+
+CHANNEL_ID = "@Premium_Giive"
+GITHUB_REPO_NAME = "Premiumm0/telegram-orders"
+GITHUB_FILE_PATH = "orders.txt"
+CARD_REQUISITES = "4323347356530466 (A-Bank)"
+
+USERS_FILE = "users_db.json"
+ORDERS_FILE = "orders_db.json"
+# ===================================================
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 
-# Счётчики и база в памяти
-all_users = set()
-total_purchases = 0
-total_earned = 0
-user_purchases_count = {}  # Личные заказы пользователей
-active_orders = {}         # Текущие заказы
+# --- Веб-сервер для предотвращения таймаутов на Render ---
+async def handle_ping(request):
+    return web.Response(text="Bot is online and healthy!")
 
-# ================= FSM (СОСТОЯНИЯ) =================
-class OrderState(StatesGroup):
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+
+async def keep_alive():
+    """Фоновое поддержание активности (15 минут)"""
+    while True:
+        await asyncio.sleep(900)
+        # Внутренний интервал безопасен для работы
+
+# --- База данных JSON ---
+def load_data(filename):
+    if os.path.exists(filename):
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_data(filename, data):
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+
+users_db = load_data(USERS_FILE)
+orders_db = load_data(ORDERS_FILE)
+
+# FSM Состояния
+class OrderFSM(StatesGroup):
     waiting_for_phone = State()
     waiting_for_receipt = State()
 
-# ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =================
-async def keep_alive():
-    """Авто-пинг раз в 15 минут, чтобы Render не спал и Telegram не банил"""
-    while True:
-        await asyncio.sleep(900)  # 15 минут (безопасный интервал)
-        try:
-            async with aiohttp.ClientSession() as session:
-                # Вставьте ссылку на ваш Render сервис, если используете Webhook/Keep-Alive
-                pass
-        except Exception:
-            pass
+def generate_order_id():
+    chars = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    return f"#Prem{chars}"
 
-# ================= ОБРАБОТЧИКИ КОМАНД =================
+def _sync_save_to_github(order_id: str, user_id: int, item: str, price: str):
+    try:
+        if not GITHUB_TOKEN:
+            return False
+        g = Github(GITHUB_TOKEN)
+        repo = g.get_repo(GITHUB_REPO_NAME)
+        
+        try:
+            contents = repo.get_contents(GITHUB_FILE_PATH)
+            current_data = contents.decoded_content.decode("utf-8")
+            sha = contents.sha
+        except Exception:
+            current_data = ""
+            sha = None
+
+        new_entry = f"Заказ: {order_id} | UserID: {user_id} | Товар: {item} | Сумма: {price}\n"
+        updated_data = current_data + new_entry
+
+        if sha:
+            repo.update_file(GITHUB_FILE_PATH, f"Добавлен заказ {order_id}", updated_data, sha)
+        else:
+            repo.create_file(GITHUB_FILE_PATH, f"Заказ {order_id}", updated_data)
+        return True
+    except Exception as e:
+        logging.error(f"Ошибка GitHub API: {e}")
+        return False
+
+async def save_order_to_github(order_id: str, user_id: int, item: str, price: str):
+    return await asyncio.to_thread(_sync_save_to_github, order_id, user_id, item, price)
+
+# Клавиатуры
+def get_main_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="💎 Купить Premium")],
+            [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="📞 Поддержка")]
+        ],
+        resize_keyboard=True
+    )
+
+def get_tariff_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📅 1 месяц — 160 грн", callback_data="buy_1_month")],
+            [InlineKeyboardButton(text="📅 1 год — 1300 грн", callback_data="buy_1_year")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")]
+        ]
+    )
+
+def get_back_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_tariffs")]
+        ]
+    )
+
+def get_payment_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📸 Отправить чек", callback_data="send_receipt")],
+            [InlineKeyboardButton(text="❌ Отменить заказ", callback_data="cancel_order")]
+        ]
+    )
+
+# Обработчики
 @router.message(CommandStart())
-async def cmd_start(message: Message):
-    # Ограничение: доступ только пользователям с @username
-    if not message.from_user.username:
-        await message.answer("⚠️ Для использования бота укажите @username в настройках Telegram профиля.")
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    user_id = str(message.from_user.id)
+    
+    if user_id not in users_db:
+        users_db[user_id] = {
+            "name": message.from_user.first_name,
+            "username": message.from_user.username,
+            "completed_orders": 0,
+            "spent_money": 0
+        }
+    else:
+        users_db[user_id]["name"] = message.from_user.first_name
+        users_db[user_id]["username"] = message.from_user.username
+        
+    save_data(USERS_FILE, users_db)
+
+    text = (
+        "👋 Добро пожаловать в магазин Telegram Premium!\n"
+        "Здесь ты можешь быстро приобрести Premium на свой аккаунт.\n\n"
+        "💎 Выберите действие:"
+    )
+    await message.answer(text, reply_markup=get_main_keyboard())
+
+@router.message(F.text == "👤 Профиль")
+async def show_profile(message: Message):
+    user_id = str(message.from_user.id)
+    
+    # Администраторская статистика
+    if message.from_user.id == ADMIN_ID:
+        total_users = len(users_db)
+        total_orders = sum(u.get("completed_orders", 0) for u in users_db.values())
+        total_revenue = sum(u.get("spent_money", 0) for u in users_db.values())
+        
+        admin_text = (
+            "👑 <b>Панель Администратора</b>\n\n"
+            f"👤 <b>Имя:</b> {message.from_user.first_name}\n"
+            f"🆔 <b>ID:</b> <code>{message.from_user.id}</code>\n\n"
+            f"📊 <b>Статистика бота:</b>\n"
+            f"👥 Пользователей в боте: <b>{total_users}</b>\n"
+            f"💎 Куплено Premium: <b>{total_orders}</b>\n"
+            f"💰 Общая выручка: <b>{total_revenue} грн</b>"
+        )
+        await message.answer(admin_text, parse_mode="HTML")
         return
 
-    all_users.add(message.from_user.id)
-    
+    # Профиль пользователя
+    user_data = users_db.get(user_id, {"name": message.from_user.first_name})
     text = (
-        f"👋 Привет, {message.from_user.first_name}!\n\n"
-        "Добро пожаловать в наш магазин. Выберите нужный раздел в меню ниже:"
+        "👤 <b>Ваш профиль</b>\n\n"
+        f"🆔 <b>ID:</b> <code>{message.from_user.id}</code>\n"
+        f"👤 <b>Имя:</b> {user_data.get('name', 'Пользователь')}"
     )
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⭐ Оформить подписку", callback_dict="buy")],
-        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")]
-    ])
-    
-    await message.answer(text, reply_markup=keyboard)
-
-@router.callback_query(F.data == "profile")
-async def show_profile(call: CallbackQuery):
-    user_id = call.from_user.id
-    username_str = f"@{call.from_user.username}" if call.from_user.username else "Отсутствует"
-
-    if user_id == ADMIN_ID:
-        text = (
-            "<b>👤 Профиль Администратора</b>\n\n"
-            f"<b>🆔 ID:</b> <code>{user_id}</code>\n"
-            f"<b>🏷 Юзернейм:</b> {username_str}\n\n"
-            "<b>📊 Статистика магазина:</b>\n"
-            f"👥 Пользователей: {len(all_users)}\n"
-            f"💎 Продано: {total_purchases}\n"
-            f"💰 Заработано: {total_earned} грн"
-        )
-    else:
-        my_orders = user_purchases_count.get(user_id, 0)
-        text = (
-            "<b>👤 Ваш профиль</b>\n\n"
-            f"<b>🆔 ID:</b> <code>{user_id}</code>\n"
-            f"<b>👤 Имя:</b> {call.from_user.first_name}\n"
-            f"<b>🏷 Юзернейм:</b> {username_str}\n"
-            f"<b>📦 Заказов:</b> {my_orders}"
-        )
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="start_menu")]
-    ])
-    
-    await call.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
-
-@router.callback_query(F.data == "start_menu")
-async def back_to_start(call: CallbackQuery):
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⭐ Оформить подписку", callback_data="buy")],
-        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")]
-    ])
-    await call.message.edit_text("Главное меню:", reply_markup=keyboard)
-
-# ================= ОФОРМЛЕНИЕ ЗАКАЗА =================
-@router.callback_query(F.data == "buy")
-async def start_buy(call: CallbackQuery, state: FSMContext):
-    await state.set_state(OrderState.waiting_for_phone)
-    await call.message.answer("📱 Введите номер телефона или логин для оформления:")
-
-@router.message(OrderState.waiting_for_phone)
-async def process_phone(message: Message, state: FSMContext):
-    await state.update_data(phone=message.text)
-    await state.set_state(OrderState.waiting_for_receipt)
-
-    import uuid
-    order_id = str(uuid.uuid4())[:8].upper()
-    await state.update_data(order_id=order_id)
-
-    # Безопасный текст с HTML-цитатами (blockquote)[cite: 2]
-    text = (
-        "<b>👛 Оплата переводом на карту</b>\n\n"
-        f"<blockquote>Заказ: #{order_id}\n"
-        "Товар: Telegram Premium\n"
-        "К оплате: 150 грн</blockquote>\n\n"
-        "<b>💳 Реквизиты для перевода</b>\n\n"
-        "<blockquote>• Банк: A-Bank\n"
-        "• Номер карты: 4323345042778606</blockquote>\n\n"
-        "<b>🤖 Что нужно сделать</b>\n\n"
-        "<blockquote>1. Переведите точную сумму на карту выше\n"
-        "2. Отправьте скриншот чека в этот чат</blockquote>"
-    )
-
     await message.answer(text, parse_mode="HTML")
 
-@router.message(OrderState.waiting_for_receipt, F.photo)
+@router.message(F.text == "📞 Поддержка")
+async def show_support(message: Message):
+    await message.answer("📞 По вопросам поддержки обращайтесь к администратору.")
+
+@router.message(F.text == "💎 Купить Premium")
+async def buy_premium_menu(message: Message):
+    await message.answer("💎 Telegram Premium", reply_markup=get_tariff_keyboard())
+
+@router.callback_query(F.data == "back_to_main")
+async def back_to_main(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+    await call.message.answer("💎 Выберите действие:", reply_markup=get_main_keyboard())
+
+@router.callback_query(F.data == "back_to_tariffs")
+async def back_to_tariffs(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text("💎 Telegram Premium", reply_markup=get_tariff_keyboard())
+
+@router.callback_query(F.data.in_({"buy_1_month", "buy_1_year"}))
+async def select_tariff(call: CallbackQuery, state: FSMContext):
+    if call.data == "buy_1_month":
+        item_name = "Premium 1 месяц"
+        price_num = 160
+        price_str = "160 грн"
+    else:
+        item_name = "Premium 1 год"
+        price_num = 1300
+        price_str = "1300 грн"
+
+    await state.update_data(item_name=item_name, price_str=price_str, price_num=price_num)
+    await state.set_state(OrderFSM.waiting_for_phone)
+
+    text = (
+        "📱 Напишите номер телефона\n"
+        "Введите номер телефона, на который зарегистрирован ваш Telegram-аккаунт.\n"
+        "Например: +380XXXXXXXXX"
+    )
+    await call.message.edit_text(text, reply_markup=get_back_keyboard())
+
+@router.message(OrderFSM.waiting_for_phone)
+async def process_phone(message: Message, state: FSMContext):
+    phone = message.text.strip()
+    data = await state.get_data()
+    
+    order_id = generate_order_id()
+    await state.update_data(phone=phone, order_id=order_id)
+    
+    orders_db[order_id] = {
+        "user_id": message.from_user.id,
+        "item": data["item_name"],
+        "price_str": data["price_str"],
+        "price_num": data["price_num"],
+        "phone": phone,
+        "status": "pending"
+    }
+    save_data(ORDERS_FILE, orders_db)
+
+    # Защищённый блок с HTML-цитатами для обохода авто-банов
+    text = (
+        "<b>💳 Оплата заказа</b>\n\n"
+        f"<blockquote>Заказ: {order_id}\n"
+        f"Товар: {data['item_name']}\n"
+        f"Номер: {phone}\n"
+        f"Стоимость: {data['price_str']}</blockquote>\n\n"
+        "<b>💳 Реквизиты для перевода</b>\n\n"
+        f"<blockquote>• Банк: MonoBank\n"
+        f"• Реквизиты: {CARD_REQUISITES}</blockquote>\n\n"
+        "<b>📌 Инструкция:</b>\n"
+        "<blockquote>1. Выполните перевод по реквизитам выше.\n"
+        "2. Нажмите «📸 Отправить чек» и прикрепите фото.\n"
+        "3. После проверки заказ будет передан в обработку.</blockquote>"
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=get_payment_keyboard())
+
+@router.callback_query(F.data == "cancel_order")
+async def cancel_order(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    order_id = data.get("order_id", "#Prem000000")
+    item = data.get("item_name", "Premium 1 месяц")
+    price = data.get("price_str", "160 грн")
+
+    await state.clear()
+    
+    text = (
+        "❌ <b>Заказ отменён</b>\n\n"
+        f"<blockquote>Заказ: {order_id}\n"
+        f"Товар: {item}\n"
+        f"Стоимость: {price}</blockquote>"
+    )
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ В главное меню", callback_data="back_to_main")]])
+    await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
+@router.callback_query(F.data == "send_receipt")
+async def request_receipt(call: CallbackQuery, state: FSMContext):
+    await state.set_state(OrderFSM.waiting_for_receipt)
+    await call.message.answer("📸 Пожалуйста, отправьте фото чека об оплате:")
+
+@router.message(OrderFSM.waiting_for_receipt, F.photo)
 async def process_receipt(message: Message, state: FSMContext):
     data = await state.get_data()
     order_id = data.get("order_id")
-    phone = data.get("phone")
-    user_id = message.from_user.id
-    photo_id = message.photo[-1].file_id
-
-    # Сохраняем в активные заказы
-    active_orders[order_id] = {
-        "user_id": user_id,
-        "phone": phone,
-        "price": 150
-    }
-
-    # Отправляем уведомление админу без лишних форматирований
-    admin_text = (
-        f"📥 Новый заказ #{order_id}\n\n"
-        f"👤 Покупатель: @{message.from_user.username} ({user_id})\n"
-        f"📱 Данные: {phone}\n"
-        f"💰 Сумма: 150 грн"
+    
+    text = (
+        "✅ <b>Чек получен!</b>\n\n"
+        f"<blockquote>Заказ: {order_id}\n"
+        "Статус: На проверке администратором</blockquote>\n\n"
+        "⏳ Ожидайте подтверждения выполнения."
     )
+    await message.answer(text, parse_mode="HTML")
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_{order_id}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{order_id}")
+    admin_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_{order_id}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{order_id}")
+            ]
         ]
-    ])
-
-    await bot.send_photo(chat_id=ADMIN_ID, photo=photo_id, caption=admin_text, reply_markup=keyboard)
-    await message.answer("⏳ Ваш чек отправлен на проверку администратору. Ожидайте выдачи!")
+    )
+    
+    admin_text = (
+        "🔔 <b>Новый чек на проверку!</b>\n\n"
+        f"<blockquote>Заказ: {order_id}\n"
+        f"Пользователь: {message.from_user.full_name} (ID: {message.from_user.id})\n"
+        f"Товар: {data.get('item_name', 'Premium')}\n"
+        f"Номер: {data.get('phone', 'Не указан')}\n"
+        f"Сумма: {data.get('price_str', '160 грн')}</blockquote>"
+    )
+    
+    await asyncio.sleep(1)  # Анти-флуд задержка
+    await bot.send_photo(
+        chat_id=ADMIN_ID,
+        photo=message.photo[-1].file_id,
+        caption=admin_text,
+        reply_markup=admin_kb,
+        parse_mode="HTML"
+    )
     await state.clear()
 
-# ================= ДЕЙСТВИЯ АДМИНИСТРАТОРА =================
 @router.callback_query(F.data.startswith("approve_"))
-async def approve_order(call: CallbackQuery):
-    global total_purchases, total_earned
+async def admin_approve(call: CallbackQuery):
     order_id = call.data.split("_")[1]
-
-    if order_id not in active_orders:
-        await call.answer("Заказ не найден или уже обработан", show_alert=True)
+    order_info = orders_db.get(order_id)
+    
+    if not order_info:
+        await call.answer("Заказ не найден.", show_alert=True)
         return
 
-    order = active_orders.pop(order_id)
-    target_user_id = order["user_id"]
-    price = order["price"]
+    if order_info.get("status") == "approved":
+        await call.answer("Этот заказ уже одобрен!", show_alert=True)
+        return
 
-    # Обновляем статистику
-    total_purchases += 1
-    total_earned += price
-    user_purchases_count[target_user_id] = user_purchases_count.get(target_user_id, 0) + 1
+    order_info["status"] = "approved"
+    orders_db[order_id] = order_info
+    save_data(ORDERS_FILE, orders_db)
 
-    # Уведомляем клиента
+    user_id = str(order_info["user_id"])
+    item = order_info["item"]
+    price_str = order_info["price_str"]
+    price_num = order_info.get("price_num", 0)
+
+    # Сохранение заказа в GitHub
+    await save_order_to_github(order_id, int(user_id), item, price_str)
+
+    # Обновление статистики пользователя
+    if user_id in users_db:
+        users_db[user_id]["completed_orders"] = users_db[user_id].get("completed_orders", 0) + 1
+        users_db[user_id]["spent_money"] = users_db[user_id].get("spent_money", 0) + price_num
+        save_data(USERS_FILE, users_db)
+
+    user_text = (
+        "🎉 <b>Оплата подтверждена!</b>\n\n"
+        f"<blockquote>Заказ: {order_id}\n"
+        f"Товар: {item}\n"
+        f"Стоимость: {price_str}</blockquote>\n\n"
+        "⏳ Заказ передан в обработку и скоро будет выполнен."
+    )
     try:
-        await bot.send_message(
-            chat_id=target_user_id,
-            text=f"🎉 Ваш заказ #{order_id} успешно выполнен! Подписка Premium активирована."
-        )
+        await bot.send_message(chat_id=int(user_id), text=user_text, parse_mode="HTML")
     except Exception:
         pass
 
-    await call.message.edit_caption(caption=f"{call.message.caption}\n\n✅ **ОДОБРЕНО**")
+    duration_text = "1 месяц" if "1 месяц" in item else "1 год"
+    channel_text = (
+        "💎 <b>Premium успешно выдан!</b>\n\n"
+        f"<blockquote>Заказ: {order_id}\n"
+        f"Подписка: {duration_text}\n"
+        f"Стоимость: {price_str}</blockquote>\n\n"
+        "✅ Заказ успешно выполнен!"
+    )
+    try:
+        await asyncio.sleep(1)
+        await bot.send_message(chat_id=CHANNEL_ID, text=channel_text, parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"Ошибка публикации в канал: {e}")
+
+    await call.message.edit_caption(caption=call.message.caption + "\n\n✅ <b>ОДОБРЕНО</b>", parse_mode="HTML", reply_markup=None)
+    await call.answer("Заказ успешно одобрен!")
 
 @router.callback_query(F.data.startswith("reject_"))
-async def reject_order(call: CallbackQuery):
+async def admin_reject(call: CallbackQuery):
     order_id = call.data.split("_")[1]
-
-    if order_id not in active_orders:
-        await call.answer("Заказ не найден или уже обработан", show_alert=True)
+    order_info = orders_db.get(order_id)
+    
+    if not order_info:
+        await call.answer("Заказ не найден.", show_alert=True)
         return
 
-    order = active_orders.pop(order_id)
-    target_user_id = order["user_id"]
+    if order_info.get("status") == "rejected":
+        await call.answer("Этот заказ уже отклонен!", show_alert=True)
+        return
 
+    order_info["status"] = "rejected"
+    orders_db[order_id] = order_info
+    save_data(ORDERS_FILE, orders_db)
+
+    user_id = str(order_info["user_id"])
     try:
-        await bot.send_message(
-            chat_id=target_user_id,
-            text=f"❌ Ваш заказ #{order_id} отклонен. Проверьте правильность отправленного чека."
-        )
+        await bot.send_message(chat_id=int(user_id), text=f"❌ Ваш заказ {order_id} был отменён администратором.")
     except Exception:
         pass
 
-    await call.message.edit_caption(caption=f"{call.message.caption}\n\n❌ **ОТКЛОНЕНО**")
+    await call.message.edit_caption(caption=call.message.caption + "\n\n❌ <b>ОТКЛОНЕНО</b>", parse_mode="HTML", reply_markup=None)
+    await call.answer("Заказ отклонён.")
 
-# ================= ЗАПУСК БОТА =================
 async def main():
+    logging.basicConfig(level=logging.INFO)
+    # Запуск микро веб-сервера для Render
+    asyncio.create_task(start_web_server())
     asyncio.create_task(keep_alive())
+    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
