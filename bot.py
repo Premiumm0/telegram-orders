@@ -7,7 +7,7 @@ import logging
 from github import Github
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart
 from aiogram.types import (
     Message, 
     CallbackQuery, 
@@ -30,8 +30,8 @@ GITHUB_REPO_NAME = "Premiumm0/telegram-orders"
 GITHUB_FILE_PATH = "orders.txt"
 CARD_REQUISITES = "4323 3473 5653 0466 (A-Bank)"
 
-USERS_FILE = "users_db.json"
-ORDERS_FILE = "orders_db.json"
+USERS_GITHUB_PATH = "users_db.json"
+ORDERS_GITHUB_PATH = "orders_db.json"
 # ===================================================
 
 bot = Bot(token=BOT_TOKEN)
@@ -39,9 +39,50 @@ dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 
-# --- Веб-сервер для предотвращения таймаутов на Render ---
+# --- Синхронизация JSON с GitHub ---
+def _load_json_from_github(filepath: str) -> dict:
+    if not GITHUB_TOKEN:
+        return {}
+    try:
+        g = Github(GITHUB_TOKEN)
+        repo = g.get_repo(GITHUB_REPO_NAME)
+        contents = repo.get_contents(filepath)
+        content_str = contents.decoded_content.decode("utf-8")
+        return json.loads(content_str)
+    except Exception as e:
+        logging.warning(f"Не удалось загрузить {filepath} из GitHub (будет создан новый): {e}")
+        return {}
+
+def _save_json_to_github(filepath: str, data: dict):
+    if not GITHUB_TOKEN:
+        return
+    try:
+        g = Github(GITHUB_TOKEN)
+        repo = g.get_repo(GITHUB_REPO_NAME)
+        json_str = json.dumps(data, ensure_ascii=False, indent=4)
+        
+        try:
+            contents = repo.get_contents(filepath)
+            sha = contents.sha
+            repo.update_file(filepath, f"Update {filepath}", json_str, sha)
+        except Exception:
+            repo.create_file(filepath, f"Create {filepath}", json_str)
+    except Exception as e:
+        logging.error(f"Ошибка сохранения {filepath} в GitHub: {e}")
+
+async def load_db_async(filepath: str) -> dict:
+    return await asyncio.to_thread(_load_json_from_github, filepath)
+
+async def save_db_async(filepath: str, data: dict):
+    await asyncio.to_thread(_save_json_to_github, filepath, data)
+
+# Глобальные словари
+users_db = {}
+orders_db = {}
+
+# --- Веб-сервер для поддержания Render ---
 async def handle_ping(request):
-    return web.Response(text="Bot is online and healthy!")
+    return web.Response(text="Bot is online!")
 
 async def start_web_server():
     app = web.Application()
@@ -53,26 +94,8 @@ async def start_web_server():
     await site.start()
 
 async def keep_alive():
-    """Фоновое поддержание активности (15 минут)"""
     while True:
         await asyncio.sleep(900)
-
-# --- База данных JSON ---
-def load_data(filename):
-    if os.path.exists(filename):
-        try:
-            with open(filename, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-def save_data(filename, data):
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
-
-users_db = load_data(USERS_FILE)
-orders_db = load_data(ORDERS_FILE)
 
 # FSM Состояния
 class OrderFSM(StatesGroup):
@@ -83,7 +106,7 @@ def generate_order_id():
     chars = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
     return f"#Prem{chars}"
 
-def _sync_save_to_github(order_id: str, user_id: int, username: str, phone: str, item: str, price: str):
+def _sync_save_to_github_txt(order_id: str, user_id: int, username: str, phone: str, item: str, price: str):
     try:
         if not GITHUB_TOKEN:
             return False
@@ -108,11 +131,11 @@ def _sync_save_to_github(order_id: str, user_id: int, username: str, phone: str,
             repo.create_file(GITHUB_FILE_PATH, f"Заказ {order_id}", updated_data)
         return True
     except Exception as e:
-        logging.error(f"Ошибка GitHub API: {e}")
+        logging.error(f"Ошибка сохранения заказов в orders.txt: {e}")
         return False
 
-async def save_order_to_github(order_id: str, user_id: int, username: str, phone: str, item: str, price: str):
-    return await asyncio.to_thread(_sync_save_to_github, order_id, user_id, username, phone, item, price)
+async def save_order_to_github_txt(order_id: str, user_id: int, username: str, phone: str, item: str, price: str):
+    return await asyncio.to_thread(_sync_save_to_github_txt, order_id, user_id, username, phone, item, price)
 
 # Клавиатуры
 def get_main_keyboard():
@@ -165,7 +188,7 @@ async def cmd_start(message: Message, state: FSMContext):
         users_db[user_id]["name"] = message.from_user.first_name
         users_db[user_id]["username"] = message.from_user.username
         
-    save_data(USERS_FILE, users_db)
+    await save_db_async(USERS_GITHUB_PATH, users_db)
 
     text = (
         "👋 Добро пожаловать в магазин Telegram Premium!\n"
@@ -178,7 +201,6 @@ async def cmd_start(message: Message, state: FSMContext):
 async def show_profile(message: Message):
     user_id = str(message.from_user.id)
     
-    # Администраторская статистика
     if message.from_user.id == ADMIN_ID:
         total_users = len(users_db)
         total_orders = sum(u.get("completed_orders", 0) for u in users_db.values())
@@ -196,7 +218,6 @@ async def show_profile(message: Message):
         await message.answer(admin_text, parse_mode="HTML")
         return
 
-    # Профиль пользователя
     user_data = users_db.get(user_id, {"name": message.from_user.first_name})
     text = (
         "👤 <b>Ваш профиль</b>\n\n"
@@ -266,7 +287,7 @@ async def process_phone(message: Message, state: FSMContext):
         "phone": phone,
         "status": "pending"
     }
-    save_data(ORDERS_FILE, orders_db)
+    await save_db_async(ORDERS_GITHUB_PATH, orders_db)
 
     text = (
         "<b>💳 Оплата заказа</b>\n\n"
@@ -368,7 +389,7 @@ async def admin_approve(call: CallbackQuery):
 
     order_info["status"] = "approved"
     orders_db[order_id] = order_info
-    save_data(ORDERS_FILE, orders_db)
+    await save_db_async(ORDERS_GITHUB_PATH, orders_db)
 
     user_id = str(order_info["user_id"])
     username = order_info.get("username", "")
@@ -377,14 +398,14 @@ async def admin_approve(call: CallbackQuery):
     price_str = order_info["price_str"]
     price_num = order_info.get("price_num", 0)
 
-    # Сохранение заказа в GitHub
-    await save_order_to_github(order_id, int(user_id), username, phone, item, price_str)
+    # Запись текстового лога в GitHub (orders.txt)
+    await save_order_to_github_txt(order_id, int(user_id), username, phone, item, price_str)
 
     # Обновление статистики пользователя
     if user_id in users_db:
         users_db[user_id]["completed_orders"] = users_db[user_id].get("completed_orders", 0) + 1
         users_db[user_id]["spent_money"] = users_db[user_id].get("spent_money", 0) + price_num
-        save_data(USERS_FILE, users_db)
+        await save_db_async(USERS_GITHUB_PATH, users_db)
 
     user_text = (
         "🎉 <b>Оплата подтверждена!</b>\n\n"
@@ -430,7 +451,7 @@ async def admin_reject(call: CallbackQuery):
 
     order_info["status"] = "rejected"
     orders_db[order_id] = order_info
-    save_data(ORDERS_FILE, orders_db)
+    await save_db_async(ORDERS_GITHUB_PATH, orders_db)
 
     user_id = str(order_info["user_id"])
     try:
@@ -443,6 +464,11 @@ async def admin_reject(call: CallbackQuery):
 
 async def main():
     logging.basicConfig(level=logging.INFO)
+    
+    global users_db, orders_db
+    users_db = await load_db_async(USERS_GITHUB_PATH)
+    orders_db = await load_db_async(ORDERS_GITHUB_PATH)
+
     asyncio.create_task(start_web_server())
     asyncio.create_task(keep_alive())
     
