@@ -8,5 +8,15 @@
         "price_num": 1300,
         "phone": "380998064209",
         "status": "approved"
+    },
+    "#PremK6QRCG": {
+        "user_id": 8660307336,
+        "username": "",
+        "full_name": "Кузнечик",
+        "item": "Premium 1 месяц",
+        "price_str": "160 грн",
+        "price_num": 160,
+        "phone": "917078413344",
+        "status": "pending_payment"
     }
 }
