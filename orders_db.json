@@ -1,1 +1,12 @@
-
+{
+    "#PremXLWLZQ": {
+        "user_id": 8787617840,
+        "username": "andreyko_Ol",
+        "full_name": "Андрей",
+        "item": "Premium 1 год",
+        "price_str": "1300 грн",
+        "price_num": 1300,
+        "phone": "380998064209",
+        "status": "pending_payment"
+    }
+}
