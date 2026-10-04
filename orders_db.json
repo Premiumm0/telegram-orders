@@ -7,6 +7,6 @@
         "price_str": "1300 грн",
         "price_num": 1300,
         "phone": "380998064209",
-        "status": "pending_payment"
+        "status": "verifying"
     }
 }
