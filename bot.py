@@ -31,7 +31,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "8787617840"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@Premium_Giive")
 GITHUB_REPO_NAME = os.getenv("GITHUB_REPO_NAME", "Premiumm0/telegram-orders")
 GITHUB_FILE_PATH = os.getenv("GITHUB_FILE_PATH", "orders.txt")
