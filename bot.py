@@ -4,9 +4,13 @@ import asyncio
 import random
 import string
 import logging
+import time
+from typing import Any, Awaitable, Callable, Dict
+from dotenv import load_dotenv
 from github import Github
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F, Router
+
+from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
 from aiogram.filters import CommandStart
 from aiogram.types import (
     Message, 
@@ -14,32 +18,73 @@ from aiogram.types import (
     ReplyKeyboardMarkup, 
     KeyboardButton, 
     InlineKeyboardMarkup, 
-    InlineKeyboardButton
+    InlineKeyboardButton,
+    TelegramObject,
+    ReplyKeyboardRemove
 )
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# ==================== НАСТРОЙКИ ====================
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-ADMIN_ID = 8661283656
+# Загрузка переменных окружения
+load_dotenv()
 
-CHANNEL_ID = "@Premium_Giive"
-GITHUB_REPO_NAME = "Premiumm0/telegram-orders"
-GITHUB_FILE_PATH = "orders.txt"
-CARD_REQUISITES = "4323 3473 5653 0466 (A-Bank)"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "8787617840"))
+CHANNEL_ID = os.getenv("CHANNEL_ID", "@Premium_Giive")
+GITHUB_REPO_NAME = os.getenv("GITHUB_REPO_NAME", "Premiumm0/telegram-orders")
+GITHUB_FILE_PATH = os.getenv("GITHUB_FILE_PATH", "orders.txt")
+CARD_REQUISITES = os.getenv("CARD_REQUISITES", "4323 3473 5653 0466 (A-Bank)")
 
 USERS_GITHUB_PATH = "users_db.json"
 ORDERS_GITHUB_PATH = "orders_db.json"
-# ===================================================
 
+if not BOT_TOKEN:
+    raise ValueError("Ошибка: BOT_TOKEN не указан в .env файле!")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# Инициализация бота
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
+
+# ==================== MIDDLEWARE (ЗАЩИТА ОТ СПАМА) ====================
+class ThrottlingMiddleware(BaseMiddleware):
+    def __init__(self, slow_mode_delay: float = 0.7):
+        self.user_timeouts = {}
+        self.slow_mode_delay = slow_mode_delay
+        super().__init__()
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        user_id = None
+        if isinstance(event, Message) and event.from_user:
+            user_id = event.from_user.id
+        elif isinstance(event, CallbackQuery) and event.from_user:
+            user_id = event.from_user.id
+
+        if user_id:
+            current_time = time.time()
+            last_time = self.user_timeouts.get(user_id, 0)
+            if current_time - last_time < self.slow_mode_delay:
+                if isinstance(event, CallbackQuery):
+                    await event.answer("⚠️ Пожалуйста, не нажимайте кнопки так часто!", show_alert=False)
+                return
+            self.user_timeouts[user_id] = current_time
+
+        return await handler(event, data)
+
+router.message.middleware(ThrottlingMiddleware())
+router.callback_query.middleware(ThrottlingMiddleware())
 dp.include_router(router)
 
-# --- Синхронизация JSON с GitHub ---
+# ==================== РАБОТА С СИНХРОНИЗАЦИЕЙ / БАЗОЙ ====================
 def _load_json_from_github(filepath: str) -> dict:
     if not GITHUB_TOKEN:
         return {}
@@ -76,35 +121,8 @@ async def load_db_async(filepath: str) -> dict:
 async def save_db_async(filepath: str, data: dict):
     await asyncio.to_thread(_save_json_to_github, filepath, data)
 
-# Глобальные словари
 users_db = {}
 orders_db = {}
-
-# --- Веб-сервер для поддержания Render ---
-async def handle_ping(request):
-    return web.Response(text="Bot is online!")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/', handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-
-async def keep_alive():
-    while True:
-        await asyncio.sleep(900)
-
-# FSM Состояния
-class OrderFSM(StatesGroup):
-    waiting_for_phone = State()
-    waiting_for_receipt = State()
-
-def generate_order_id():
-    chars = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-    return f"#Prem{chars}"
 
 def _sync_save_to_github_txt(order_id: str, user_id: int, username: str, phone: str, item: str, price: str):
     try:
@@ -131,13 +149,35 @@ def _sync_save_to_github_txt(order_id: str, user_id: int, username: str, phone: 
             repo.create_file(GITHUB_FILE_PATH, f"Заказ {order_id}", updated_data)
         return True
     except Exception as e:
-        logging.error(f"Ошибка сохранения заказов в orders.txt: {e}")
+        logging.error(f"Ошибка сохранения заказов в txt: {e}")
         return False
 
 async def save_order_to_github_txt(order_id: str, user_id: int, username: str, phone: str, item: str, price: str):
     return await asyncio.to_thread(_sync_save_to_github_txt, order_id, user_id, username, phone, item, price)
 
-# Клавиатуры
+# ==================== ВЕБ-СЕРВЕРДЛЯ KEEP-ALIVE ====================
+async def handle_ping(request):
+    return web.Response(text="Bot is online!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+
+# ==================== FSM СОСТОЯНИЯ ====================
+class OrderFSM(StatesGroup):
+    waiting_for_phone = State()
+    waiting_for_receipt = State()
+
+def generate_order_id() -> str:
+    chars = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    return f"#Prem{chars}"
+
+# ==================== КЛАВИАТУРЫ ====================
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -145,6 +185,16 @@ def get_main_keyboard():
             [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="📞 Поддержка")]
         ],
         resize_keyboard=True
+    )
+
+def get_phone_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📱 Поделиться контактом", request_contact=True)],
+            [KeyboardButton(text="❌ Отмена")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
     )
 
 def get_tariff_keyboard():
@@ -156,13 +206,6 @@ def get_tariff_keyboard():
         ]
     )
 
-def get_back_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_tariffs")]
-        ]
-    )
-
 def get_payment_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -171,13 +214,13 @@ def get_payment_keyboard():
         ]
     )
 
-# Обработчики
+# ==================== ОБРАБОТЧИКИ ====================
 @router.message(CommandStart())
+@router.message(F.text == "❌ Отмена")
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     user_id = str(message.from_user.id)
     
-    # Загружаем свежие данные перед записью
     global users_db
     latest_db = await load_db_async(USERS_GITHUB_PATH)
     if latest_db:
@@ -186,28 +229,26 @@ async def cmd_start(message: Message, state: FSMContext):
     if user_id not in users_db:
         users_db[user_id] = {
             "name": message.from_user.first_name,
-            "username": message.from_user.username,
+            "username": message.from_user.username or "",
             "completed_orders": 0,
             "spent_money": 0
         }
     else:
         users_db[user_id]["name"] = message.from_user.first_name
-        users_db[user_id]["username"] = message.from_user.username
+        users_db[user_id]["username"] = message.from_user.username or ""
         
     await save_db_async(USERS_GITHUB_PATH, users_db)
 
     text = (
-        "👋 Добро пожаловать в магазин Telegram Premium!\n"
-        "Здесь ты можешь быстро приобрести Premium на свой аккаунт.\n\n"
-        "💎 Выберите действие:"
+        "👋 **Добро пожаловать в магазин цифровых подписок!**\n\n"
+        "Выберите интересующий раздел в меню ниже:"
     )
-    await message.answer(text, reply_markup=get_main_keyboard())
+    await message.answer(text, parse_mode="Markdown", reply_markup=get_main_keyboard())
 
 @router.message(F.text == "👤 Профиль")
 async def show_profile(message: Message):
     user_id = str(message.from_user.id)
     
-    # Синхронизация с GitHub перед показом профиля
     global users_db
     latest_db = await load_db_async(USERS_GITHUB_PATH)
     if latest_db:
@@ -218,11 +259,7 @@ async def show_profile(message: Message):
         "completed_orders": 0,
         "spent_money": 0
     })
-    
-    completed_orders = user_data.get("completed_orders", 0)
-    spent_money = user_data.get("spent_money", 0)
 
-    # Панель Администратора
     if message.from_user.id == ADMIN_ID:
         total_users = len(users_db)
         total_orders = sum(u.get("completed_orders", 0) for u in users_db.values())
@@ -232,35 +269,31 @@ async def show_profile(message: Message):
             "👑 <b>Панель Администратора</b>\n\n"
             f"👤 <b>Имя:</b> {message.from_user.first_name}\n"
             f"🆔 <b>ID:</b> <code>{message.from_user.id}</code>\n\n"
-            f"📊 <b>Общая статистика бота:</b>\n"
-            f"👥 Пользователей в боте: <b>{total_users}</b>\n"
-            f"💎 Куплено Premium: <b>{total_orders}</b>\n"
-            f"💰 Общая выручка: <b>{total_revenue} грн</b>\n\n"
-            f"👤 <b>Ваши личные покупки:</b>\n"
-            f"💎 Куплено Premium: <b>{completed_orders}</b>\n"
-            f"💰 Потрачено: <b>{spent_money} грн</b>"
+            f"📊 <b>Статистика сервиса:</b>\n"
+            f"👥 Пользователей: <b>{total_users}</b>\n"
+            f"💎 Выполнено заказов: <b>{total_orders}</b>\n"
+            f"💰 Общая выручка: <b>{total_revenue} грн</b>\n"
         )
         await message.answer(admin_text, parse_mode="HTML")
         return
 
-    # Профиль стандартного пользователя
     text = (
         "👤 <b>Ваш профиль</b>\n\n"
         f"🆔 <b>ID:</b> <code>{message.from_user.id}</code>\n"
         f"👤 <b>Имя:</b> {user_data.get('name', 'Пользователь')}\n\n"
-        f"📊 <b>Ваша статистика:</b>\n"
-        f"💎 Куплено Premium: <b>{completed_orders}</b>\n"
-        f"💰 Потрачено всего: <b>{spent_money} грн</b>"
+        f"📊 <b>Ваши покупки:</b>\n"
+        f"💎 Завершено заказов: <b>{user_data.get('completed_orders', 0)}</b>\n"
+        f"💰 Потрачено: <b>{user_data.get('spent_money', 0)} грн</b>"
     )
     await message.answer(text, parse_mode="HTML")
 
 @router.message(F.text == "📞 Поддержка")
 async def show_support(message: Message):
-    await message.answer("📞 По вопросам поддержки обращайтесь к администратору.")
+    await message.answer("📞 По всем вопросам обратитесь к администратору магазина.")
 
 @router.message(F.text == "💎 Купить Premium")
 async def buy_premium_menu(message: Message):
-    await message.answer("💎 Telegram Premium", reply_markup=get_tariff_keyboard())
+    await message.answer("💎 **Выберите период подписки Premium:**", parse_mode="Markdown", reply_markup=get_tariff_keyboard())
 
 @router.callback_query(F.data == "back_to_main")
 async def back_to_main(call: CallbackQuery, state: FSMContext):
@@ -270,11 +303,6 @@ async def back_to_main(call: CallbackQuery, state: FSMContext):
     except Exception:
         pass
     await call.message.answer("💎 Выберите действие:", reply_markup=get_main_keyboard())
-
-@router.callback_query(F.data == "back_to_tariffs")
-async def back_to_tariffs(call: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await call.message.edit_text("💎 Telegram Premium", reply_markup=get_tariff_keyboard())
 
 @router.callback_query(F.data.in_({"buy_1_month", "buy_1_year"}))
 async def select_tariff(call: CallbackQuery, state: FSMContext):
@@ -291,15 +319,18 @@ async def select_tariff(call: CallbackQuery, state: FSMContext):
     await state.set_state(OrderFSM.waiting_for_phone)
 
     text = (
-        "📱 Напишите номер телефона\n"
-        "Введите номер телефона, на который зарегистрирован ваш Telegram-аккаунт.\n"
-        "Например: +380XXXXXXXXX"
+        "📱 Нажмите на кнопку **«📱 Поделиться контактом»** ниже, "
+        "чтобы подтвердить аккаунт для оформления подписки."
     )
-    await call.message.edit_text(text, reply_markup=get_back_keyboard())
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+    await call.message.answer(text, parse_mode="Markdown", reply_markup=get_phone_keyboard())
 
-@router.message(OrderFSM.waiting_for_phone)
+@router.message(OrderFSM.waiting_for_phone, F.contact)
 async def process_phone(message: Message, state: FSMContext):
-    phone = message.text.strip()
+    phone = message.contact.phone_number
     data = await state.get_data()
     
     order_id = generate_order_id()
@@ -307,68 +338,66 @@ async def process_phone(message: Message, state: FSMContext):
     
     orders_db[order_id] = {
         "user_id": message.from_user.id,
-        "username": message.from_user.username,
+        "username": message.from_user.username or "",
         "full_name": message.from_user.full_name,
         "item": data["item_name"],
         "price_str": data["price_str"],
         "price_num": data["price_num"],
         "phone": phone,
-        "status": "pending"
+        "status": "pending_payment"
     }
     await save_db_async(ORDERS_GITHUB_PATH, orders_db)
 
     text = (
-        "<b>💳 Оплата заказа</b>\n\n"
-        f"<blockquote>Заказ: {order_id}\n"
-        f"Товар: {data['item_name']}\n"
-        f"Номер: {phone}\n"
-        f"Стоимость: {data['price_str']}</blockquote>\n\n"
-        "<b>💳 Реквизиты для перевода</b>\n\n"
-        f"<blockquote>• Банк: A-Bank\n"
-        f"• Реквизиты: {CARD_REQUISITES}</blockquote>\n\n"
-        "<b>📌 Инструкция:</b>\n"
-        "<blockquote>1. Выполните перевод по реквизитам выше.\n"
-        "2. Нажмите «📸 Отправить чек» и прикрепите фото.\n"
-        "3. После проверки заказ будет передан в обработку.</blockquote>"
+        "<b>💳 Реквизиты для оплаты</b>\n\n"
+        f"<b>Заказ:</b> <code>{order_id}</code>\n"
+        f"<b>Товар:</b> {data['item_name']}\n"
+        f"<b>Сумма к оплате:</b> {data['price_str']}\n\n"
+        f"<b>Карта (A-Bank):</b> <code>{CARD_REQUISITES}</code>\n\n"
+        "📌 <b>Инструкция:</b>\n"
+        "1. Совершите перевод на указанную сумму.\n"
+        "2. Нажмите кнопку <b>«📸 Отправить чек»</b> и прикрепите фото/скриншот чека."
     )
     await message.answer(text, parse_mode="HTML", reply_markup=get_payment_keyboard())
 
 @router.callback_query(F.data == "cancel_order")
 async def cancel_order(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    order_id = data.get("order_id", "#Prem000000")
-    item = data.get("item_name", "Premium 1 месяц")
-    price = data.get("price_str", "160 грн")
-
     await state.clear()
-    
-    text = (
-        "❌ <b>Заказ отменён</b>\n\n"
-        f"<blockquote>Заказ: {order_id}\n"
-        f"Товар: {item}\n"
-        f"Стоимость: {price}</blockquote>"
-    )
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ В главное меню", callback_data="back_to_main")]])
-    await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await call.message.edit_text("❌ Заказ был отменен.", reply_markup=None)
+    await call.message.answer("Главное меню:", reply_markup=get_main_keyboard())
 
 @router.callback_query(F.data == "send_receipt")
 async def request_receipt(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("order_id"):
+        await call.answer("Ошибка заказа. Начните оформление заново.", show_alert=True)
+        await state.clear()
+        return
+
     await state.set_state(OrderFSM.waiting_for_receipt)
-    await call.message.answer("📸 Пожалуйста, отправьте фото чека об оплате:")
+    await call.message.answer("📸 Отправьте фото или скриншот чека об оплате:")
 
 @router.message(OrderFSM.waiting_for_receipt, F.photo)
 async def process_receipt(message: Message, state: FSMContext):
     data = await state.get_data()
     order_id = data.get("order_id")
     
-    text = (
-        "✅ <b>Чек получен!</b>\n\n"
-        f"<blockquote>Заказ: {order_id}\n"
-        "Статус: На проверке администратором</blockquote>\n\n"
-        "⏳ Ожидайте подтверждения выполнения."
+    order_info = orders_db.get(order_id)
+    if not order_info or order_info.get("status") in ["approved", "verifying"]:
+        await message.answer("⚠️ Этот заказ уже обрабатывается или был завершен.")
+        await state.clear()
+        return
+
+    order_info["status"] = "verifying"
+    orders_db[order_id] = order_info
+    await save_db_async(ORDERS_GITHUB_PATH, orders_db)
+
+    await message.answer(
+        f"✅ **Чек по заказу {order_id} принят!**\n"
+        "Ожидайте подтверждения от администратора.",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard()
     )
-    await message.answer(text, parse_mode="HTML")
 
     admin_kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -379,27 +408,27 @@ async def process_receipt(message: Message, state: FSMContext):
         ]
     )
     
-    username_str = f"@{message.from_user.username}" if message.from_user.username else "Нет юзернейма"
-    
+    username_str = f"@{message.from_user.username}" if message.from_user.username else "Без юзернейма"
     admin_text = (
         "🔔 <b>Новый чек на проверку!</b>\n\n"
-        f"<blockquote>Заказ: {order_id}\n"
-        f"Пользователь: {message.from_user.full_name}\n"
-        f"Юзернейм: {username_str}\n"
-        f"ID: {message.from_user.id}\n"
-        f"Товар: {data.get('item_name', 'Premium')}\n"
-        f"Номер: {data.get('phone', 'Не указан')}\n"
-        f"Сумма: {data.get('price_str', '160 грн')}</blockquote>"
+        f"<b>Заказ:</b> {order_id}\n"
+        f"<b>Пользователь:</b> {message.from_user.full_name} ({username_str})\n"
+        f"<b>ID:</b> <code>{message.from_user.id}</code>\n"
+        f"<b>Товар:</b> {data.get('item_name')}\n"
+        f"<b>Сумма:</b> {data.get('price_str')}"
     )
     
-    await asyncio.sleep(1)
-    await bot.send_photo(
-        chat_id=ADMIN_ID,
-        photo=message.photo[-1].file_id,
-        caption=admin_text,
-        reply_markup=admin_kb,
-        parse_mode="HTML"
-    )
+    try:
+        await bot.send_photo(
+            chat_id=ADMIN_ID,
+            photo=message.photo[-1].file_id,
+            caption=admin_text,
+            reply_markup=admin_kb,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.error(f"Не удалось отправить уведомление админу: {e}")
+
     await state.clear()
 
 @router.callback_query(F.data.startswith("approve_"))
@@ -411,8 +440,9 @@ async def admin_approve(call: CallbackQuery):
         await call.answer("Заказ не найден.", show_alert=True)
         return
 
+    # Защита от повторного выполнения
     if order_info.get("status") == "approved":
-        await call.answer("Этот заказ уже одобрен!", show_alert=True)
+        await call.answer("⚠️️ Этот заказ УЖЕ был обработан и выдан!", show_alert=True)
         return
 
     order_info["status"] = "approved"
@@ -426,10 +456,10 @@ async def admin_approve(call: CallbackQuery):
     price_str = order_info["price_str"]
     price_num = order_info.get("price_num", 0)
 
-    # Сохранение заказа в текстовый файл orders.txt
+    # Сохранение текстовой записи
     await save_order_to_github_txt(order_id, int(user_id), username, phone, item, price_str)
 
-    # Обновление свежей базы перед сохранением
+    # Обновление баланса пользователя
     global users_db
     latest_db = await load_db_async(USERS_GITHUB_PATH)
     if latest_db:
@@ -447,34 +477,34 @@ async def admin_approve(call: CallbackQuery):
     users_db[user_id]["spent_money"] = users_db[user_id].get("spent_money", 0) + price_num
     await save_db_async(USERS_GITHUB_PATH, users_db)
 
+    # Уведомление покупателю
     user_text = (
         "🎉 <b>Оплата подтверждена!</b>\n\n"
-        f"<blockquote>Заказ: {order_id}\n"
-        f"Товар: {item}\n"
-        f"Стоимость: {price_str}</blockquote>\n\n"
-        "⏳ Заказ передан в обработку и скоро будет выполнен."
+        f"<b>Заказ:</b> {order_id}\n"
+        f"<b>Товар:</b> {item}\n\n"
+        "Ваша подписка отправлена в активацию!"
     )
     try:
         await bot.send_message(chat_id=int(user_id), text=user_text, parse_mode="HTML")
-    except Exception:
-        pass
+    except Exception as e:
+        logging.error(f"Не удалось отправить сообщение пользователю {user_id}: {e}")
 
-    duration_text = "1 месяц" if "1 месяц" in item else "1 год"
+    # Публикация в канал
     channel_text = (
-        "💎 <b>Premium успешно выдан!</b>\n\n"
-        f"<blockquote>Заказ: {order_id}\n"
-        f"Подписка: {duration_text}\n"
-        f"Стоимость: {price_str}</blockquote>\n\n"
-        "✅ Заказ успешно выполнен!"
+        "💎 <b>Новая покупка!</b>\n\n"
+        f"Заказ <code>{order_id}</code> на {item} успешно выполнен!"
     )
     try:
-        await asyncio.sleep(1)
         await bot.send_message(chat_id=CHANNEL_ID, text=channel_text, parse_mode="HTML")
     except Exception as e:
-        logging.error(f"Ошибка публикации в канал: {e}")
+        logging.error(f"Ошибка отправки в канал {CHANNEL_ID}: {e}")
 
-    await call.message.edit_caption(caption=call.message.caption + "\n\n✅ <b>ОДОБРЕНО</b>", parse_mode="HTML", reply_markup=None)
-    await call.answer("Заказ успешно одобрен!")
+    await call.message.edit_caption(
+        caption=(call.message.caption or "") + "\n\n✅ <b>ОДОБРЕНО (Товар выдан)</b>", 
+        parse_mode="HTML", 
+        reply_markup=None
+    )
+    await call.answer("Заказ успешно подтвержден!")
 
 @router.callback_query(F.data.startswith("reject_"))
 async def admin_reject(call: CallbackQuery):
@@ -485,8 +515,8 @@ async def admin_reject(call: CallbackQuery):
         await call.answer("Заказ не найден.", show_alert=True)
         return
 
-    if order_info.get("status") == "rejected":
-        await call.answer("Этот заказ уже отклонен!", show_alert=True)
+    if order_info.get("status") in ["approved", "rejected"]:
+        await call.answer("Заказ уже был обработан ранее!", show_alert=True)
         return
 
     order_info["status"] = "rejected"
@@ -495,23 +525,27 @@ async def admin_reject(call: CallbackQuery):
 
     user_id = str(order_info["user_id"])
     try:
-        await bot.send_message(chat_id=int(user_id), text=f"❌ Ваш заказ {order_id} был отменён администратором.")
+        await bot.send_message(chat_id=int(user_id), text=f"❌ Ваш заказ {order_id} был отклонен администратором.")
     except Exception:
         pass
 
-    await call.message.edit_caption(caption=call.message.caption + "\n\n❌ <b>ОТКЛОНЕНО</b>", parse_mode="HTML", reply_markup=None)
-    await call.answer("Заказ отклонён.")
+    await call.message.edit_caption(
+        caption=(call.message.caption or "") + "\n\n❌ <b>ОТКЛОНЕНО</b>", 
+        parse_mode="HTML", 
+        reply_markup=None
+    )
+    await call.answer("Заказ отклонен.")
 
+# ==================== ЗАПУСК ====================
 async def main():
-    logging.basicConfig(level=logging.INFO)
-    
     global users_db, orders_db
     users_db = await load_db_async(USERS_GITHUB_PATH)
     orders_db = await load_db_async(ORDERS_GITHUB_PATH)
 
     asyncio.create_task(start_web_server())
-    asyncio.create_task(keep_alive())
     
+    # Удаление вебхука и запуск long-polling
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
